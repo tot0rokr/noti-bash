@@ -1,0 +1,556 @@
+#!/usr/bin/env bash
+# noti — Discord Webhook 통합 Bash 알림 스크립트
+#
+# 요구사항:
+#   - 환경변수 NOTI_WEBHOOK 에 Discord Webhook URL 설정 (또는 .noti.conf 의 webhook 키)
+#   - (권장) jq 설치 시 JSON/Embed 고급 기능 활성화
+#
+# 사용법(요약):
+#   export NOTI_WEBHOOK="https://discord.com/api/webhooks/..."
+#   noti send "배포 시작"
+#   noti embed --title "Build" --desc "✅ Success" --color 3066993 --field Branch main --field Duration "12m 3s"
+#   noti file ./build.log --message "빌드 로그"
+#   noti run --title "Build" --attach-log-on-fail -- make build
+#   noti help
+#
+# 안전 기본값:
+#   - allowed_mentions.parse = [] 로 멘션(@everyone 등) 차단 (옵션으로 허용 가능)
+#   - 429(레이트 리밋) 자동 재시도
+#
+set -Eeuo pipefail
+shopt -s extglob
+
+# -------- Debug 옵션 --------
+# NOTI_DEBUG=0 (default/off) | 1 (basic) | 2 (verbose: payload preview)
+_is_debug() { [[ "${NOTI_DEBUG:-0}" =~ ^(1|2|true|yes|on)$ ]]; }
+_is_debug2() { [[ "${NOTI_DEBUG:-0}" =~ ^(2)$ ]]; }
+_dbg() {
+  _is_debug || return 0; printf '[noti:debug] %s
+' "$*" >&2;
+}
+_dbg2() {
+  _is_debug2 || return 0; printf '[noti:debug2] %s
+' "$*" >&2;
+}
+_mask_url() {
+  sed -E 's#(https://discord.com/api/webhooks/[^/]+/)[^/?]+#\1***#g'
+}
+
+shopt -s extglob
+
+# 별칭(프리셋) 지원: .noti.preset 파싱을 위한 맵
+declare -A NOTI_ALIAS
+
+# -------- 공통 유틸 --------
+WEBHOOK_URL="${NOTI_WEBHOOK:-}"
+
+has_jq() { command -v jq >/dev/null 2>&1; }
+
+# debug() { [[ "${NOTI_DEBUG:-0}" != "0" ]] && echo "[noti][debug] $*" >&2; }
+debug() { _dbg "$@"; return 0; }
+
+json_escape() {
+  # jq가 없을 때 최소 이스케이프 (백슬래시/쌍따옴표/개행)
+  sed -e 's/\\/\\\\/g' -e 's/\"/\\\"/g' -e ':a;N;$!ba;s/\n/\\n/g'
+}
+
+hms() {
+  local sec="$1"; local h=$((sec/3600)); local m=$(((sec%3600)/60)); local s=$((sec%60))
+  printf '%02dh %02dm %02ds' "$h" "$m" "$s"
+}
+
+# ---- 설정 파일 경로/파서 ----
+get_config_file() {
+  if [[ -n "${NOTI_CONFIG:-}" && -f "$NOTI_CONFIG" ]]; then printf '%s
+' "$NOTI_CONFIG"; return; fi
+  if [[ -f ./.noti.conf ]]; then printf '%s
+' ./.noti.conf; return; fi
+  if [[ -f "$HOME/.noti.conf" ]]; then printf '%s
+' "$HOME/.noti.conf"; return; fi
+  return 1
+}
+
+# ---- 프리셋 파일 경로 ----
+get_preset_file() {
+  if [[ -n "${NOTI_PRESET:-}" && -f "$NOTI_PRESET" ]]; then printf '%s
+' "$NOTI_PRESET"; return; fi
+  if [[ -f ./.noti.preset ]]; then printf '%s
+' ./.noti.preset; return; fi
+  if [[ -f "$HOME/.noti.preset" ]]; then printf '%s
+' "$HOME/.noti.preset"; return; fi
+  return 1
+}
+
+resolve_webhook_from_config() {
+  local cfg; cfg=$(get_config_file) || return 1
+  while IFS= read -r line; do
+    line="${line%$'\r'}"           # CR 제거
+    line="${line%%#*}"              # 주석 제거
+    line="${line##+([[:space:]])}"  # 좌공백 제거
+    line="${line%%+([[:space:]])}"  # 우공백 제거
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ ^([A-Za-z0-9._-]+)[[:space:]]*[:=][[:space:]]*(.*)$ ]]; then
+      local key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+      case "$key" in
+        webhook|NOTI_WEBHOOK|webhook_url) WEBHOOK_URL="$val"; return 0 ;;
+      esac
+    fi
+  done < "$cfg"
+  return 1
+}
+
+resolve_webhook() {
+  [[ -n "${WEBHOOK_URL:-}" ]] && return 0
+  [[ -n "${NOTI_WEBHOOK:-}" ]] && { WEBHOOK_URL="$NOTI_WEBHOOK"; return 0; }
+  resolve_webhook_from_config || true
+  [[ -n "${WEBHOOK_URL:-}" ]]
+}
+
+ensure_webhook_or_die() {
+  if ! resolve_webhook; then
+    echo "[noti] NOTI_WEBHOOK 이 설정되지 않았고 .noti.conf 에서 webhook 을 찾지 못함" >&2
+    echo "export NOTI_WEBHOOK=\"https://discord.com/api/webhooks/...\"" >&2
+    echo "또는 .noti.conf 에 \"webhook = https://discord.com/api/webhooks/...\" 추가" >&2
+    exit 2
+  fi
+}
+
+# ---- 별칭(.noti.conf) 로딩 ----
+load_aliases() {
+  local cfg cnt=0
+  declare -Ag NOTI_ALIAS
+  NOTI_ALIAS=()
+
+  # 프리셋 파일 찾기
+  if [[ -n "${NOTI_PRESET:-}" && -f "$NOTI_PRESET" ]]; then
+    cfg="$NOTI_PRESET"
+  elif [[ -f ./.noti.preset ]]; then
+    cfg="./.noti.preset"
+  elif [[ -f "$HOME/.noti.preset" ]]; then
+    cfg="$HOME/.noti.preset"
+  else
+    _dbg ".noti.preset not found"
+    return 0
+  fi
+
+  _dbg "loading presets from $cfg"
+  while IFS= read -r line; do
+    # CR 제거, 주석/양끝 공백 제거
+    line="${line%$'\r'}"
+    line="${line%%#*}"
+    line="${line##+([[:space:]])}"
+    line="${line%%+([[:space:]])}"
+    [[ -z "$line" ]] && continue
+    if [[ "$line" =~ ^([A-Za-z0-9._-]+)[[:space:]]*[:=][[:space:]]*(.*)$ ]]; then
+      local name="${BASH_REMATCH[1]}" tmpl="${BASH_REMATCH[2]}"
+      NOTI_ALIAS["$name"]="$tmpl"; cnt=$((cnt+1))
+    fi
+  done < "$cfg"
+  _dbg "loaded ${cnt} presets"
+}
+
+shell_escape() { printf '%q' "$1"; }
+join_escaped() { local out=""; for a in "$@"; do out+=" $(shell_escape "$a")"; done; printf '%s' "${out# }"; }
+
+is_builtin() { case "$1" in send|embed|file|run|help|--help|-h) return 0;; *) return 1;; esac }
+
+# ---- HTTP 전송 ----
+post_json() {
+  # 인자: JSON 문자열
+  local payload="$1"; local max_retry=${2:-5}
+  local attempt=0
+  local plen=${#payload}
+  _dbg "post_json start url=$(printf '%s' "$WEBHOOK_URL" | _mask_url) size=${plen}"
+  _dbg2 "payload_preview=$(printf '%.200s' "$payload")"
+  while :; do
+    attempt=$((attempt+1))
+    local tmp
+    tmp=$(mktemp)
+    local code
+    _dbg "curl attempt=${attempt}"
+    code=$(curl -sS -o "$tmp" -w "%{http_code}" \
+      -H 'Content-Type: application/json' \
+      --data "$payload" \
+      "$WEBHOOK_URL" || echo "000")
+
+    _dbg "http_code=${code}"
+    if [[ "$code" == "204" ]]; then
+      rm -f "$tmp"
+      _dbg "success (204)"
+      return 0
+    elif [[ "$code" == "429" ]]; then
+      local wait=1
+      if has_jq; then
+        wait=$(jq -r '.retry_after // 1' < "$tmp" 2>/dev/null || echo 1)
+      else
+        wait=$(grep -o '"retry_after"[^0-9]*[0-9]\+\(\.[0-9]\+\)?' "$tmp" | grep -o '[0-9]\+' | head -n1 || echo 1)
+      fi
+      if [[ "$wait" -gt 60 ]]; then wait=$((wait/1000)); fi
+      _dbg "rate limited, retry_after=${wait}s"
+      sleep "${wait}"
+    elif [[ "$code" =~ ^5 ]]; then
+      local backoff=$(( (attempt < 6 ? attempt : 5) ))
+      _dbg "server error, backoff=${backoff}s"
+      sleep $(( backoff ))
+    else
+      echo "[noti] HTTP $code: $(cat "$tmp")" >&2
+      rm -f "$tmp"
+      return 1
+    fi
+
+    if (( attempt >= max_retry )); then
+      echo "[noti] 재시도 한도 초과($max_retry)" >&2
+      rm -f "$tmp"
+      return 1
+    fi
+    rm -f "$tmp"
+  done
+}
+
+send_text() {
+  local msg="$1"; local allow="${2:-false}"
+  if has_jq; then
+    if [[ "$allow" == "true" ]]; then
+      post_json "$(jq -n --arg c "$msg" '{content:$c}')"
+    else
+      post_json "$(jq -n --arg c "$msg" '{content:$c, allowed_mentions:{parse:[]}}')"
+    fi
+  else
+    local esc; esc=$(printf '%s' "$msg" | json_escape)
+    if [[ "$allow" == "true" ]]; then
+      post_json "{\"content\":\"$esc\"}"
+    else
+      post_json "{\"content\":\"$esc\",\"allowed_mentions\":{\"parse\":[]}}"
+    fi
+  fi
+}
+
+send_embed() {
+  local title="" desc="" color=""; shift 0
+  local fields_json="[]" allow_mentions=false
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title) title="$2"; shift 2;;
+      --desc|--description) desc="$2"; shift 2;;
+      --color) color="$2"; shift 2;;
+      --field)
+        local name="$2"; local value="$3"; shift 3
+        if has_jq; then
+          fields_json=$(jq -c --arg n "$name" --arg v "$value" \
+            '. + [{name:$n, value:$v, inline:true}]' <<<"$fields_json")
+        else
+          local txt; txt="${title:+[$title] }${desc} ${name}: ${value}"
+          send_text "$txt" "$allow_mentions"; return 0
+        fi
+        ;;
+      --allow-mentions) allow_mentions=true; shift;;
+      *) echo "[embed] 알 수 없는 옵션: $1" >&2; exit 1;;
+    esac
+  done
+
+  if ! has_jq; then
+    send_text "${title:+[$title] }$desc" "$allow_mentions"; return 0
+  fi
+
+  local embed
+  if [[ -n "$color" ]]; then
+    embed=$(jq -n --arg t "$title" --arg d "$desc" --argjson f "$fields_json" --argjson c "$color" \
+      '{embeds:[{title:$t, description:$d, color:$c, fields:$f}]}' )
+  else
+    embed=$(jq -n --arg t "$title" --arg d "$desc" --argjson f "$fields_json" \
+      '{embeds:[{title:$t, description:$d, fields:$f}]}' )
+  fi
+  [[ "$allow_mentions" != true ]] && embed=$(jq -c '. + {allowed_mentions:{parse:[]}}' <<<"$embed")
+  post_json "$embed"
+}
+
+send_file() {
+  local filepath="$1"; shift || true
+  local message=""
+  local allow_mentions="false"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --message) message="$2"; shift 2;;
+      --allow-mentions) allow_mentions="true"; shift;;
+      *) echo "[file] 알 수 없는 옵션: $1" >&2; exit 1;;
+    esac
+  done
+  if [[ ! -f "$filepath" ]]; then
+    echo "[noti] 파일 없음: $filepath" >&2
+    exit 1
+  fi
+  _dbg "send_file path=$filepath url=$(printf '%s' "$WEBHOOK_URL" | _mask_url)"
+  local payload
+  if has_jq; then
+    if [[ "$allow_mentions" == "true" ]]; then
+      payload=$(jq -n --arg c "$message" '{content:$c}')
+    else
+      payload=$(jq -n --arg c "$message" '{content:$c, allowed_mentions:{parse:[]}}')
+    fi
+  else
+    local esc
+    esc=$(printf '%s' "$message" | json_escape)
+    if [[ "$allow_mentions" == "true" ]]; then
+      payload="{\"content\":\"$esc\"}"
+    else
+      payload="{\"content\":\"$esc\",\"allowed_mentions\":{\"parse\":[]}}"
+    fi
+  fi
+  local code
+  code=$(curl -sS -o /dev/null -w "%{http_code}" \
+    -F "file1=@${filepath}" \
+    -F "payload_json=${payload}" \
+    "$WEBHOOK_URL" || echo "000")
+  _dbg "send_file http_code=${code}"
+  if [[ "$code" != "204" ]]; then
+    echo "[noti] 파일 업로드 실패 HTTP $code" >&2
+    return 1
+  fi
+}
+
+run_and_alert() {
+  local title="Task" attach_fail=false attach_all=false allow_mentions=false
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --title) title="$2"; shift 2;;
+      --attach-log-on-fail) attach_fail=true; shift;;
+      --attach-log) attach_all=true; shift;;
+      --allow-mentions) allow_mentions=true; shift;;
+      --) shift; break;;
+      *) break;;
+    esac
+  done
+  if [[ $# -lt 1 ]]; then
+    echo "[run] 실행할 명령이 필요함 (-- 로 구분)" >&2; exit 1
+  fi
+
+  local start_ts end_ts rc icon
+  start_ts=$(date +%s)
+  local start_human; start_human=$(date '+%F %T')
+
+  local log; log=$(mktemp)
+  set +e
+  ("$@") > >(tee "$log") 2> >(tee -a "$log" >&2)
+  rc=$?
+  set -e
+
+  end_ts=$(date +%s)
+  local end_human; end_human=$(date '+%F %T')
+  local dur=$((end_ts - start_ts))
+  local dur_human; dur_human=$(hms "$dur")
+
+  if (( rc == 0 )); then icon="✅"; else icon="❌"; fi
+  local base_msg; base_msg="$icon ${title} | exit=${rc} | ${dur_human} | ${start_human} → ${end_human}"
+
+  if [[ "$attach_all" == true || ( "$attach_fail" == true && $rc -ne 0 ) ]]; then
+    send_text "$base_msg" "$allow_mentions"
+    if [[ $rc -ne 0 ]]; then
+      send_file "$log" --message "${title} log (FAIL)" $( [[ "$allow_mentions" == true ]] && echo "--allow-mentions" )
+    else
+      send_file "$log" --message "${title} log" $( [[ "$allow_mentions" == true ]] && echo "--allow-mentions" )
+    fi
+  else
+    if has_jq; then
+      local color; color=$(( rc == 0 ? 3066993 : 15158332 ))
+      local payload
+      payload=$(jq -n \
+        --arg t "$title" \
+        --arg s "$start_human" \
+        --arg e "$end_human" \
+        --arg d "$dur_human" \
+        --arg r "$rc" \
+        --arg i "$icon" \
+        --arg cmd "$*" \
+        --argjson color "$color" \
+        '{embeds:[{title:$t, description:($i+" " + (if ($r=="0") then "Success" else "Failed" end)), color:$color, fields:[
+          {name:"Command", value:$cmd, inline:false},
+          {name:"Exit", value:$r, inline:true},
+          {name:"Duration", value:$d, inline:true},
+          {name:"Start", value:$s, inline:false},
+          {name:"End", value:$e, inline:false}
+        ]}]}' )
+      [[ "$allow_mentions" != true ]] && payload=$(jq -c '. + {allowed_mentions:{parse:[]}}' <<<"$payload")
+      post_json "$payload"
+    else
+      send_text "$base_msg" "$allow_mentions"
+    fi
+  fi
+
+  rm -f "$log"
+  return $rc
+}
+
+print_help() {
+  cat <<'HLP'
+noti — Discord Webhook 통합 Bash 알림
+
+환경변수:
+  NOTI_WEBHOOK   Discord webhook URL (필수, 또는 .noti.conf 의 webhook 키)
+  NOTI_CONFIG    설정 파일 경로(.noti.conf) 강제 지정 (선택)
+  NOTI_PRESET    프리셋 파일 경로(.noti.preset) 강제 지정 (선택)
+  NOTI_DEBUG     0=off(기본), 1=기본 디버그, 2=자세한 디버그(페이로드 앞 200자 프리뷰)
+
+서브커맨드:
+  send [--allow-mentions] <message>
+      단순 텍스트 메시지 전송 (기본은 멘션 차단)
+
+  embed --title <t> --desc <d> [--color <int>] [--field <name> <value>]... [--allow-mentions]
+      임베드 카드 전송 (jq 필요). color는 10진 정수
+
+  file <path> [--message <m>] [--allow-mentions]
+      파일(로그 등) 업로드
+
+  run [--title <t>] [--attach-log] [--attach-log-on-fail] [--allow-mentions] -- <cmd> [args...]
+      명령 실행 후 결과/요약 전송. --attach-log(-on-fail)로 실행 로그 첨부
+
+프리셋(.noti.preset):
+  - 위치: $NOTI_PRESET 또는 ./.noti.preset 또는 ~/.noti.preset
+  - 형식: 한 줄에 하나, '이름 = 템플릿' 또는 '이름: 템플릿'
+  - 템플릿 안에서 $1 $2 ... $@ 사용 가능 (git alias 느낌)
+  - 예약어: send, embed, file, run, help, -h, --help 는 프리셋 이름으로 사용 불가
+  - 사용: noti <이름> <args...>
+
+설정(.noti.conf):
+  - 위치: $NOTI_CONFIG 또는 ./.noti.conf 또는 ~/.noti.conf
+  - 키: webhook 또는 NOTI_WEBHOOK 또는 webhook_url 중 하나에 URL 지정
+
+예시 .noti.preset:
+  deploy = embed --title "Deploy" --desc "$1" --color 3066993 --field Service api --field Version "$2"
+  ping = send "[PING] $1"
+  test-fail = run --title "CI: $1" --attach-log-on-fail -- bash -lc "$2"
+  tarball = run --title "Tar $1" -- bash -lc 'tar -czf "$2" ${@:3}'
+
+예시 .noti.conf:
+  webhook = https://discord.com/api/webhooks/xxx/yyy
+
+예시 사용:
+  noti deploy "배포 성공" v1.2.3
+  noti ping "서버 살아있음"
+  noti test-fail unit "make test"
+
+디버그 사용법:
+  export NOTI_DEBUG=1   # 기본 디버그
+  export NOTI_DEBUG=2   # 페이로드 프리뷰 포함
+HLP
+}
+
+# ---- 디스패처 (내장 서브커맨드 실행) ----
+noti_dispatch() {
+  local subcmd="$1"; shift || true
+  case "$subcmd" in
+    send)
+      local allow=false
+      if [[ "${1:-}" == "--allow-mentions" ]]; then allow=true; shift; fi
+      [[ $# -ge 1 ]] || { echo "메시지를 입력" >&2; exit 1; }
+      send_text "$*" "$allow"
+      ;;
+    embed)
+      send_embed "$@"
+      ;;
+    file)
+      [[ $# -ge 1 ]] || { echo "파일 경로 필요" >&2; exit 1; }
+      local fpath="$1"; shift
+      send_file "$fpath" "$@"
+      ;;
+    run)
+      run_and_alert "$@"
+      ;;
+    help|--help|-h)
+      print_help
+      ;;
+    *)
+      echo "알 수 없는 명령: $subcmd" >&2
+      print_help
+      exit 1
+      ;;
+  esac
+}
+
+# ---- 프리셋(별칭) 실행 ----
+# # --- preset executor (git alias 스타일: $1 $2 $@ 지원) ---
+run_alias() {
+  local name="$1"; shift || true
+  load_aliases
+  case "$name" in send|embed|file|run|help|-h|--help)
+    echo "[noti] 예약어는 프리셋 이름으로 사용할 수 없음: $name" >&2
+    exit 1
+  esac
+  local tmpl="${NOTI_ALIAS[$name]:-}"
+  if [[ -z "$tmpl" ]]; then
+    echo "알 수 없는 명령 또는 프리셋 없음: $name" >&2
+    exit 1
+  fi
+
+  local args=("$@")
+  _dbg "alias: $name | args: ${args[*]}"
+
+  (
+    # 프리셋 인자 바인딩
+    set -- "${args[@]}"
+    # 템플릿 안의 $1 $2 $@ 확장 → argv 재구성
+    # shellcheck disable=SC2086
+    eval "set -- $tmpl"
+
+    _dbg "expanded: noti $*"
+
+    # 자기 자신을 재호출(무한루프 방지: 여기서는 최종 실제 서브커맨드로 바뀜)
+    if command -v noti >/dev/null 2>&1; then
+      exec noti "$@"
+    else
+      exec "$0" "$@"
+    fi
+  )
+}
+# run_alias() {
+#   local name="$1"; shift || true
+#   load_aliases
+#   [[ ${NOTI_ALIAS[$name]+_} ]] || { echo "프리셋 없음: $name" >&2; exit 1; }
+#   # 프리셋 이름이 예약어면 금지
+#   is_builtin "$name" && { echo "'$name' 는 예약어라 프리셋 이름으로 사용할 수 없음" >&2; exit 1; }
+
+#   local tmpl="${NOTI_ALIAS[$name]}"
+#   local args=("$@")
+#   local expanded="$tmpl"
+#   # $@, $* 먼저 치환 (셸 안전)
+#   local all; all=$(join_escaped "${args[@]}")
+#   expanded=${expanded//\$@/$all}
+#   expanded=${expanded//\$*/$all}
+#   # $1..$9 치환
+#   local i
+#   for ((i=1; i<=${#args[@]}; i++)); do
+#     local repl; repl=$(shell_escape "${args[i-1]}")
+#     expanded=${expanded//\$${i}/$repl}
+#   done
+
+#   debug "alias '$name' => $expanded"
+
+#   # 실행: noti 내장 디스패처로 전달
+#   eval "set -- $expanded"
+#   local subcmd="${1:-}"; shift || true
+#   if is_builtin "$subcmd"; then
+#     noti_dispatch "$subcmd" "$@"
+#   else
+#     echo "프리셋 '$name' 가 내장 명령이 아닌 것을 호출하려 함: '$subcmd'" >&2
+#     echo "템플릿은 send/embed/file/run 중 하나로 시작해야 함" >&2
+#     exit 1
+#   fi
+# }
+
+# -------- 진입점 --------
+if [[ $# -eq 0 ]]; then
+  print_help
+  exit 0
+fi
+
+# 빌트인/프리셋 분기 (shift 시점 명확화)
+if is_builtin "${1:-}"; then
+  sub="$1"; shift
+  debug "builtin: $sub | args: $*"
+  noti_dispatch "$sub" "$@"
+else
+  name="$1"; shift || true
+  debug "alias: $name | args: $*"
+  run_alias "$name" "$@"
+fi
+

@@ -1,0 +1,15 @@
+# 한 줄에 하나, "이름 = 템플릿" 또는 "이름: 템플릿"
+# 템플릿 안에서 $1 $2 ... $@ 사용 가능 (git alias 스타일)
+
+# 예: 배포 결과를 embed로 보내기 (인자: 메시지, 버전)
+deploy = embed --title "Deploy" --desc "$1" --color 3066993 --field Service api --field Version "$2"
+
+# 예: 핑
+ping = send "[PING] $1"
+
+# 예: 실패시만 로그 첨부하여 실행 (인자: 태그, 명령문)
+test-fail = run --title "CI: $1" --attach-log-on-fail -- bash -lc "$2"
+
+# 예: 명령 중간에 $1 $2 끼워넣기 (추가 args는 $@로 전달)
+# noti tarball v1.2.3 build/output.tgz ./build <--- 이런 식
+echo = run --title "Echo $1" -- bash -lc "echo $@"
