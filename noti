@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
-# noti — Discord Webhook 통합 Bash 알림 스크립트
+# SPDX-License-Identifier: BSD-3-Clause
+# noti — Discord/Slack Webhook 통합 Bash 알림 스크립트
 #
 # 요구사항:
-#   - 환경변수 NOTI_WEBHOOK 에 Discord Webhook URL 설정 (또는 .noti.conf 의 webhook 키)
+#   - 환경변수 NOTI_WEBHOOK 에 Discord 또는 Slack incoming webhook URL 설정
+#     (또는 .noti.conf 의 webhook 키)
 #   - (권장) jq 설치 시 JSON/Embed 고급 기능 활성화
 #
+# Provider 자동 감지:
+#   https://discord.com/api/webhooks/...   → Discord (send/embed/file/run)
+#   https://hooks.slack.com/services/...   → Slack  (send/embed/run; file 미지원)
+#
 # 사용법(요약):
-#   export NOTI_WEBHOOK="https://discord.com/api/webhooks/..."
+#   export NOTI_WEBHOOK="https://discord.com/api/webhooks/..."   # 또는
+#   export NOTI_WEBHOOK="https://hooks.slack.com/services/..."
 #   noti send "배포 시작"
 #   noti embed --title "Build" --desc "✅ Success" --color 3066993 --field Branch main --field Duration "12m 3s"
-#   noti file ./build.log --message "빌드 로그"
+#   noti file ./build.log --message "빌드 로그"        # Slack 에서는 미지원
 #   noti run --title "Build" --attach-log-on-fail -- make build
 #   noti help
 #
 # 안전 기본값:
-#   - allowed_mentions.parse = [] 로 멘션(@everyone 등) 차단 (옵션으로 허용 가능)
-#   - 429(레이트 리밋) 자동 재시도
+#   - Discord: allowed_mentions.parse = [] 로 멘션(@everyone 등) 차단 (옵션으로 허용 가능)
+#   - 429(레이트 리밋) 자동 재시도 (Discord: body retry_after, Slack: Retry-After 헤더)
 #
 set -Eeuo pipefail
 shopt -s extglob
@@ -33,7 +40,9 @@ _dbg2() {
 ' "$*" >&2;
 }
 _mask_url() {
-  sed -E 's#(https://discord.com/api/webhooks/[^/]+/)[^/?]+#\1***#g'
+  sed -E \
+    -e 's#(https://(discord|discordapp|ptb\.discord|canary\.discord)\.com/api/webhooks/[^/]+/)[^/?]+#\1***#g' \
+    -e 's#(https://hooks\.slack\.com/services/[^/]+/[^/]+/)[^/?]+#\1***#g'
 }
 
 shopt -s extglob
@@ -43,8 +52,59 @@ declare -A NOTI_ALIAS
 
 # -------- 공통 유틸 --------
 WEBHOOK_URL="${NOTI_WEBHOOK:-}"
+WEBHOOK_PROVIDER=""   # "discord" | "slack" — detect_provider() 가 채움
+
+# 임베드 상태 색상 (10진수). normalize_color() 가 provider별로 변환.
+NOTI_COLOR_OK="3066993"      # green
+NOTI_COLOR_FAIL="15158332"   # red
 
 has_jq() { command -v jq >/dev/null 2>&1; }
+
+# Webhook URL 로부터 provider 판별. 성공 시 0, 매칭 실패 시 1.
+detect_provider() {
+  local url="$1"
+  # NOTI_PROVIDER_OVERRIDE 는 테스트 전용 (mock 서버 대상 localhost URL용).
+  # 정식 인터페이스가 아니므로 help 에는 노출하지 않음.
+  if [[ -n "${NOTI_PROVIDER_OVERRIDE:-}" ]]; then
+    case "${NOTI_PROVIDER_OVERRIDE}" in
+      discord|slack) WEBHOOK_PROVIDER="${NOTI_PROVIDER_OVERRIDE}"; return 0 ;;
+      *) echo "[noti] invalid NOTI_PROVIDER_OVERRIDE: ${NOTI_PROVIDER_OVERRIDE}" >&2; return 1 ;;
+    esac
+  fi
+  case "$url" in
+    https://discord.com/api/webhooks/*|\
+    https://discordapp.com/api/webhooks/*|\
+    https://ptb.discord.com/api/webhooks/*|\
+    https://canary.discord.com/api/webhooks/*)
+      WEBHOOK_PROVIDER=discord; return 0 ;;
+    https://hooks.slack.com/services/*)
+      WEBHOOK_PROVIDER=slack;   return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# 색상 정규화. 입력: 10진수 (3066993), hex (#2ecc71), 또는 0x표기 (0x2ecc71).
+# 출력: discord → 10진 정수, slack → "#rrggbb".
+# 빈 입력은 그대로 빈 문자열 반환 (caller 가 처리).
+normalize_color() {
+  local v="$1" p="$2" hex dec
+  [[ -z "$v" ]] && return 0
+  case "$v" in
+    \#*)      hex="${v#\#}" ;;
+    0x*|0X*)  hex="${v#0[xX]}" ;;
+    *[!0-9]*) echo "[noti] invalid color: $v" >&2; return 1 ;;
+    *)        dec="$v" ;;
+  esac
+  if [[ -z "${dec:-}" ]]; then
+    [[ "$hex" =~ ^[0-9a-fA-F]{6}$ ]] || { echo "[noti] invalid hex color: $v" >&2; return 1; }
+    dec=$((16#$hex))
+  fi
+  case "$p" in
+    discord) printf '%d' "$dec" ;;
+    slack)   printf '#%06x' "$dec" ;;
+    *) echo "[noti] normalize_color: unknown provider '$p'" >&2; return 1 ;;
+  esac
+}
 
 # debug() { [[ "${NOTI_DEBUG:-0}" != "0" ]] && echo "[noti][debug] $*" >&2; }
 debug() { _dbg "$@"; return 0; }
@@ -109,10 +169,18 @@ resolve_webhook() {
 ensure_webhook_or_die() {
   if ! resolve_webhook; then
     echo "[noti] NOTI_WEBHOOK 이 설정되지 않았고 .noti.conf 에서 webhook 을 찾지 못함" >&2
-    echo "export NOTI_WEBHOOK=\"https://discord.com/api/webhooks/...\"" >&2
-    echo "또는 .noti.conf 에 \"webhook = https://discord.com/api/webhooks/...\" 추가" >&2
+    echo "  export NOTI_WEBHOOK=\"https://discord.com/api/webhooks/...\"   # Discord" >&2
+    echo "  export NOTI_WEBHOOK=\"https://hooks.slack.com/services/...\"   # Slack" >&2
+    echo "또는 .noti.conf 에 \"webhook = <URL>\" 추가" >&2
     exit 2
   fi
+  if ! detect_provider "$WEBHOOK_URL"; then
+    echo "[noti] Unrecognized webhook URL provider." >&2
+    echo "  Supported: Discord (discord.com/api/webhooks/...), Slack (hooks.slack.com/services/...)" >&2
+    echo "  Got: $(printf '%s' "$WEBHOOK_URL" | _mask_url)" >&2
+    exit 2
+  fi
+  _dbg "provider=${WEBHOOK_PROVIDER}"
 }
 
 # ---- 별칭(.noti.conf) 로딩 ----
@@ -160,32 +228,46 @@ post_json() {
   local payload="$1"; local max_retry=${2:-5}
   local attempt=0
   local plen=${#payload}
-  _dbg "post_json start url=$(printf '%s' "$WEBHOOK_URL" | _mask_url) size=${plen}"
+  local ok_codes
+  case "$WEBHOOK_PROVIDER" in
+    discord) ok_codes="204" ;;
+    slack)   ok_codes="200" ;;
+    *)       echo "[noti] post_json: WEBHOOK_PROVIDER not set" >&2; return 1 ;;
+  esac
+  _dbg "post_json start provider=${WEBHOOK_PROVIDER} url=$(printf '%s' "$WEBHOOK_URL" | _mask_url) size=${plen}"
   _dbg2 "payload_preview=$(printf '%.200s' "$payload")"
   while :; do
     attempt=$((attempt+1))
-    local tmp
-    tmp=$(mktemp)
-    local code
+    local tmp hdr code
+    tmp=$(mktemp); hdr=$(mktemp)
     _dbg "curl attempt=${attempt}"
-    code=$(curl -sS -o "$tmp" -w "%{http_code}" \
+    code=$(curl -sS -o "$tmp" -D "$hdr" -w "%{http_code}" \
       -H 'Content-Type: application/json' \
       --data "$payload" \
       "$WEBHOOK_URL" || echo "000")
 
     _dbg "http_code=${code}"
-    if [[ "$code" == "204" ]]; then
-      rm -f "$tmp"
-      _dbg "success (204)"
+    if [[ " $ok_codes " == *" $code "* ]]; then
+      rm -f "$tmp" "$hdr"
+      _dbg "success ($code)"
       return 0
     elif [[ "$code" == "429" ]]; then
       local wait=1
-      if has_jq; then
-        wait=$(jq -r '.retry_after // 1' < "$tmp" 2>/dev/null || echo 1)
-      else
-        wait=$(grep -o '"retry_after"[^0-9]*[0-9]\+\(\.[0-9]\+\)?' "$tmp" | grep -o '[0-9]\+' | head -n1 || echo 1)
-      fi
-      if [[ "$wait" -gt 60 ]]; then wait=$((wait/1000)); fi
+      case "$WEBHOOK_PROVIDER" in
+        discord)
+          if has_jq; then
+            wait=$(jq -r '.retry_after // 1' < "$tmp" 2>/dev/null || echo 1)
+          else
+            wait=$(grep -o '"retry_after"[^0-9]*[0-9]\+\(\.[0-9]\+\)\?' "$tmp" | grep -o '[0-9]\+' | head -n1 || echo 1)
+          fi
+          # 일부 Discord 응답이 ms 단위로 큰 값을 줄 때 보정
+          if [[ "$wait" -gt 60 ]]; then wait=$((wait/1000)); fi
+          ;;
+        slack)
+          wait=$(awk 'BEGIN{IGNORECASE=1} /^retry-after:/ {gsub(/\r/,""); print $2; exit}' "$hdr")
+          [[ -z "$wait" ]] && wait=1
+          ;;
+      esac
       _dbg "rate limited, retry_after=${wait}s"
       sleep "${wait}"
     elif [[ "$code" =~ ^5 ]]; then
@@ -194,20 +276,29 @@ post_json() {
       sleep $(( backoff ))
     else
       echo "[noti] HTTP $code: $(cat "$tmp")" >&2
-      rm -f "$tmp"
+      rm -f "$tmp" "$hdr"
       return 1
     fi
 
     if (( attempt >= max_retry )); then
       echo "[noti] 재시도 한도 초과($max_retry)" >&2
-      rm -f "$tmp"
+      rm -f "$tmp" "$hdr"
       return 1
     fi
-    rm -f "$tmp"
+    rm -f "$tmp" "$hdr"
   done
 }
 
+# ---- send_text: provider dispatcher ----
 send_text() {
+  case "$WEBHOOK_PROVIDER" in
+    discord) send_text_discord "$@" ;;
+    slack)   send_text_slack   "$@" ;;
+    *) echo "[noti] send_text: unknown provider '$WEBHOOK_PROVIDER'" >&2; return 1 ;;
+  esac
+}
+
+send_text_discord() {
   local msg="$1"; local allow="${2:-false}"
   if has_jq; then
     if [[ "$allow" == "true" ]]; then
@@ -225,32 +316,70 @@ send_text() {
   fi
 }
 
-send_embed() {
-  local title="" desc="" color=""; shift 0
-  local fields_json="[]" allow_mentions=false
+send_text_slack() {
+  local msg="$1"; local allow="${2:-false}"
+  # Slack incoming webhook 은 평문 @channel/@here 를 멘션으로 변환하지 않음
+  # (<!channel> 형태만 활성 멘션). --allow-mentions 는 사실상 no-op.
+  if [[ "$allow" == "true" ]]; then _dbg "send_text_slack: --allow-mentions is a no-op for incoming webhooks"; fi
+  if (( ${#msg} > 3900 )); then
+    echo "[noti] warn: Slack text length ${#msg} > 3900 (Slack 4000자 한도). 그대로 전송." >&2
+  fi
+  if has_jq; then
+    post_json "$(jq -n --arg t "$msg" '{text:$t}')"
+  else
+    local esc; esc=$(printf '%s' "$msg" | json_escape)
+    post_json "{\"text\":\"$esc\"}"
+  fi
+}
 
+# ---- send_embed: provider dispatcher ----
+send_embed() {
+  case "$WEBHOOK_PROVIDER" in
+    discord) send_embed_discord "$@" ;;
+    slack)   send_embed_slack   "$@" ;;
+    *) echo "[noti] send_embed: unknown provider '$WEBHOOK_PROVIDER'" >&2; return 1 ;;
+  esac
+}
+
+# embed 인자 파싱 결과를 caller-local 변수로 채움:
+#   _PE_TITLE _PE_DESC _PE_COLOR _PE_FIELDS_JSON _PE_ALLOW_MENTIONS
+# field 갯수를 _PE_FIELDS_COUNT 에 기록.
+_parse_embed_args() {
+  _PE_TITLE=""; _PE_DESC=""; _PE_COLOR=""
+  _PE_FIELDS_JSON="[]"; _PE_ALLOW_MENTIONS=false; _PE_FIELDS_COUNT=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      --title) title="$2"; shift 2;;
-      --desc|--description) desc="$2"; shift 2;;
-      --color) color="$2"; shift 2;;
+      --title) _PE_TITLE="$2"; shift 2;;
+      --desc|--description) _PE_DESC="$2"; shift 2;;
+      --color) _PE_COLOR="$2"; shift 2;;
       --field)
         local name="$2"; local value="$3"; shift 3
+        _PE_FIELDS_COUNT=$((_PE_FIELDS_COUNT+1))
         if has_jq; then
-          fields_json=$(jq -c --arg n "$name" --arg v "$value" \
-            '. + [{name:$n, value:$v, inline:true}]' <<<"$fields_json")
+          _PE_FIELDS_JSON=$(jq -c --arg n "$name" --arg v "$value" \
+            '. + [{name:$n, value:$v, inline:true}]' <<<"$_PE_FIELDS_JSON")
         else
-          local txt; txt="${title:+[$title] }${desc} ${name}: ${value}"
-          send_text "$txt" "$allow_mentions"; return 0
+          # no-jq 경로에서는 field 를 텍스트로 평탄화 (caller 가 처리)
+          _PE_DESC+=$'\n'"${name}: ${value}"
         fi
         ;;
-      --allow-mentions) allow_mentions=true; shift;;
+      --allow-mentions) _PE_ALLOW_MENTIONS=true; shift;;
       *) echo "[embed] 알 수 없는 옵션: $1" >&2; exit 1;;
     esac
   done
+}
+
+send_embed_discord() {
+  _parse_embed_args "$@"
+  local title="$_PE_TITLE" desc="$_PE_DESC" color="$_PE_COLOR"
+  local fields_json="$_PE_FIELDS_JSON" allow_mentions="$_PE_ALLOW_MENTIONS"
 
   if ! has_jq; then
-    send_text "${title:+[$title] }$desc" "$allow_mentions"; return 0
+    send_text_discord "${title:+[$title] }$desc" "$allow_mentions"; return $?
+  fi
+
+  if [[ -n "$color" ]]; then
+    color=$(normalize_color "$color" discord) || return 1
   fi
 
   local embed
@@ -265,7 +394,63 @@ send_embed() {
   post_json "$embed"
 }
 
+send_embed_slack() {
+  _parse_embed_args "$@"
+  local title="$_PE_TITLE" desc="$_PE_DESC" color="$_PE_COLOR"
+  local fields_json="$_PE_FIELDS_JSON" allow_mentions="$_PE_ALLOW_MENTIONS"
+
+  if [[ "$allow_mentions" == true ]]; then
+    _dbg "send_embed_slack: --allow-mentions is a no-op for incoming webhooks"
+  fi
+  if (( _PE_FIELDS_COUNT > 10 )); then
+    echo "[noti] warn: Slack attachment field 수 ${_PE_FIELDS_COUNT} > 10 (한도). 그대로 전송." >&2
+  fi
+
+  if ! has_jq; then
+    send_text_slack "${title:+[$title] }$desc" "$allow_mentions"; return $?
+  fi
+
+  if [[ -n "$color" ]]; then
+    color=$(normalize_color "$color" slack) || return 1
+  fi
+
+  # 최상위 text 는 fallback (알림/구버전 클라이언트용). title 우선, 없으면 desc.
+  local top_text="${title:-$desc}"
+
+  local payload
+  payload=$(jq -n \
+    --arg top   "$top_text" \
+    --arg title "$title" \
+    --arg desc  "$desc" \
+    --arg color "$color" \
+    --argjson fields "$fields_json" \
+    '{
+       text: $top,
+       attachments: [
+         ({
+            color: (if $color == "" then null else $color end),
+            title: (if $title == "" then null else $title end),
+            text:  (if $desc  == "" then null else $desc  end),
+            fields: ($fields | map({title:.name, value:.value, short:.inline})),
+            mrkdwn_in: ["text","fields"]
+          } | with_entries(select(.value != null)))
+       ]
+     }')
+  post_json "$payload"
+}
+
 send_file() {
+  if [[ "$WEBHOOK_PROVIDER" == "slack" ]]; then
+    echo "[noti] Slack incoming webhook 은 파일 업로드를 지원하지 않습니다." >&2
+    echo "[noti] 'noti send' 로 텍스트 본문 전송 또는 파일을 별도 공유 채널에 업로드해 주세요." >&2
+    # TODO(slack-bot-token): Slack Bot Token (xoxb-...) + files.upload API + chat.postMessage
+    # 로 thread-reply 파일 첨부를 지원할 수 있음. v1 범위 외.
+    return 2
+  fi
+  send_file_discord "$@"
+}
+
+send_file_discord() {
   local filepath="$1"; shift || true
   local message=""
   local allow_mentions="false"
@@ -309,6 +494,84 @@ send_file() {
   fi
 }
 
+# Slack용 로그 인라인 첨부 fallback. logfile 의 마지막 ~3500자만 코드블록으로 전송.
+# Slack incoming webhook 은 thread_ts 를 받지 못하므로 진짜 스레드 댓글은 불가.
+_attach_log_inline_slack() {
+  local logfile="$1" caption="${2:-}"
+  local max_chars=3500
+  local body
+  body=$(tail -c "$max_chars" -- "$logfile" 2>/dev/null || true)
+  if [[ -z "$body" ]]; then
+    body="(empty log)"
+  fi
+  # 트리플 백틱 안의 ``` 가 본문에 있으면 깨질 수 있어 보호.
+  body=${body//\`\`\`/\`\`\`}  # noop, 가독성용. Slack 은 fenced 안의 백틱을 그대로 표시.
+  local prefix=""
+  [[ -n "$caption" ]] && prefix="${caption}"$'\n'
+  send_text_slack "${prefix}"$'```\n'"${body}"$'\n```' false
+}
+
+# run_and_alert 의 상태 임베드를 provider 별로 빌드.
+# 인자: title icon rc dur_human start_human end_human cmd allow_mentions
+# stdout: JSON payload (post_json 으로 전달).
+_build_run_embed_discord() {
+  local title="$1" icon="$2" rc="$3" dur="$4" start_h="$5" end_h="$6" cmd="$7" allow="$8"
+  local color; color=$(( rc == 0 ? NOTI_COLOR_OK : NOTI_COLOR_FAIL ))
+  local payload
+  payload=$(jq -n \
+    --arg t "$title" \
+    --arg s "$start_h" \
+    --arg e "$end_h" \
+    --arg d "$dur" \
+    --arg r "$rc" \
+    --arg i "$icon" \
+    --arg cmd "$cmd" \
+    --argjson color "$color" \
+    '{embeds:[{title:$t, description:($i+" " + (if ($r=="0") then "Success" else "Failed" end)), color:$color, fields:[
+      {name:"Command", value:$cmd, inline:false},
+      {name:"Exit", value:$r, inline:true},
+      {name:"Duration", value:$d, inline:true},
+      {name:"Start", value:$s, inline:false},
+      {name:"End", value:$e, inline:false}
+    ]}]}' )
+  [[ "$allow" != true ]] && payload=$(jq -c '. + {allowed_mentions:{parse:[]}}' <<<"$payload")
+  printf '%s' "$payload"
+}
+
+_build_run_embed_slack() {
+  local title="$1" icon="$2" rc="$3" dur="$4" start_h="$5" end_h="$6" cmd="$7" _allow="$8"
+  local color_dec; color_dec=$(( rc == 0 ? NOTI_COLOR_OK : NOTI_COLOR_FAIL ))
+  local color; color=$(printf '#%06x' "$color_dec")
+  local status_word
+  if [[ "$rc" == "0" ]]; then status_word="Success"; else status_word="Failed"; fi
+  jq -n \
+    --arg t "$title" \
+    --arg s "$start_h" \
+    --arg e "$end_h" \
+    --arg d "$dur" \
+    --arg r "$rc" \
+    --arg i "$icon" \
+    --arg cmd "$cmd" \
+    --arg desc "${icon} ${status_word}" \
+    --arg color "$color" \
+    '{
+       text: $t,
+       attachments: [{
+         color: $color,
+         title: $t,
+         text: $desc,
+         fields: [
+           {title:"Command",  value:$cmd, short:false},
+           {title:"Exit",     value:$r,   short:true},
+           {title:"Duration", value:$d,   short:true},
+           {title:"Start",    value:$s,   short:false},
+           {title:"End",      value:$e,   short:false}
+         ],
+         mrkdwn_in: ["text","fields"]
+       }]
+     }'
+}
+
 run_and_alert() {
   local title="Task" attach_fail=false attach_all=false allow_mentions=false
   while [[ $# -gt 0 ]]; do
@@ -342,35 +605,36 @@ run_and_alert() {
 
   if (( rc == 0 )); then icon="✅"; else icon="❌"; fi
   local base_msg; base_msg="$icon ${title} | exit=${rc} | ${dur_human} | ${start_human} → ${end_human}"
+  local cmd_str="$*"
 
+  local attach_now=false
   if [[ "$attach_all" == true || ( "$attach_fail" == true && $rc -ne 0 ) ]]; then
+    attach_now=true
+  fi
+
+  if [[ "$attach_now" == true ]]; then
     send_text "$base_msg" "$allow_mentions"
-    if [[ $rc -ne 0 ]]; then
-      send_file "$log" --message "${title} log (FAIL)" $( [[ "$allow_mentions" == true ]] && echo "--allow-mentions" )
-    else
-      send_file "$log" --message "${title} log" $( [[ "$allow_mentions" == true ]] && echo "--allow-mentions" )
-    fi
+    local caption
+    if [[ $rc -ne 0 ]]; then caption="${title} log (FAIL)"; else caption="${title} log"; fi
+    case "$WEBHOOK_PROVIDER" in
+      discord)
+        if [[ "$allow_mentions" == true ]]; then
+          send_file_discord "$log" --message "$caption" --allow-mentions
+        else
+          send_file_discord "$log" --message "$caption"
+        fi
+        ;;
+      slack)
+        _attach_log_inline_slack "$log" "$caption"
+        ;;
+    esac
   else
     if has_jq; then
-      local color; color=$(( rc == 0 ? 3066993 : 15158332 ))
       local payload
-      payload=$(jq -n \
-        --arg t "$title" \
-        --arg s "$start_human" \
-        --arg e "$end_human" \
-        --arg d "$dur_human" \
-        --arg r "$rc" \
-        --arg i "$icon" \
-        --arg cmd "$*" \
-        --argjson color "$color" \
-        '{embeds:[{title:$t, description:($i+" " + (if ($r=="0") then "Success" else "Failed" end)), color:$color, fields:[
-          {name:"Command", value:$cmd, inline:false},
-          {name:"Exit", value:$r, inline:true},
-          {name:"Duration", value:$d, inline:true},
-          {name:"Start", value:$s, inline:false},
-          {name:"End", value:$e, inline:false}
-        ]}]}' )
-      [[ "$allow_mentions" != true ]] && payload=$(jq -c '. + {allowed_mentions:{parse:[]}}' <<<"$payload")
+      case "$WEBHOOK_PROVIDER" in
+        discord) payload=$(_build_run_embed_discord "$title" "$icon" "$rc" "$dur_human" "$start_human" "$end_human" "$cmd_str" "$allow_mentions") ;;
+        slack)   payload=$(_build_run_embed_slack   "$title" "$icon" "$rc" "$dur_human" "$start_human" "$end_human" "$cmd_str" "$allow_mentions") ;;
+      esac
       post_json "$payload"
     else
       send_text "$base_msg" "$allow_mentions"
@@ -383,26 +647,35 @@ run_and_alert() {
 
 print_help() {
   cat <<'HLP'
-noti — Discord Webhook 통합 Bash 알림
+noti — Discord/Slack Webhook 통합 Bash 알림 스크립트
+
+Provider 자동 감지:
+  https://discord.com/api/webhooks/...   → Discord (send/embed/file/run 전체)
+  https://hooks.slack.com/services/...   → Slack  (send/embed/run; file 미지원)
 
 환경변수:
-  NOTI_WEBHOOK   Discord webhook URL (필수, 또는 .noti.conf 의 webhook 키)
+  NOTI_WEBHOOK   Discord 또는 Slack incoming webhook URL (필수, 또는 .noti.conf 의 webhook 키)
   NOTI_CONFIG    설정 파일 경로(.noti.conf) 강제 지정 (선택)
   NOTI_PRESET    프리셋 파일 경로(.noti.preset) 강제 지정 (선택)
   NOTI_DEBUG     0=off(기본), 1=기본 디버그, 2=자세한 디버그(페이로드 앞 200자 프리뷰)
 
 서브커맨드:
   send [--allow-mentions] <message>
-      단순 텍스트 메시지 전송 (기본은 멘션 차단)
+      단순 텍스트 메시지 전송
+      Discord: 기본 멘션 차단(allowed_mentions.parse=[])
+      Slack:   --allow-mentions 는 no-op (평문 @channel 은 멘션 안 됨)
 
-  embed --title <t> --desc <d> [--color <int>] [--field <name> <value>]... [--allow-mentions]
-      임베드 카드 전송 (jq 필요). color는 10진 정수
+  embed --title <t> --desc <d> [--color <c>] [--field <name> <value>]... [--allow-mentions]
+      임베드 카드 전송 (jq 필요).
+      --color 는 10진수(3066993), hex(#2ecc71), 0x표기(0x2ecc71) 모두 허용.
+      Slack 에서는 attachment 의 색상 사이드바로 매핑됨.
 
   file <path> [--message <m>] [--allow-mentions]
-      파일(로그 등) 업로드
+      파일(로그 등) 업로드. Discord 전용 (Slack 미지원: exit 2).
 
   run [--title <t>] [--attach-log] [--attach-log-on-fail] [--allow-mentions] -- <cmd> [args...]
-      명령 실행 후 결과/요약 전송. --attach-log(-on-fail)로 실행 로그 첨부
+      명령 실행 후 결과/요약 전송. --attach-log(-on-fail)로 실행 로그 첨부.
+      Slack 에서는 로그를 인라인 코드블록으로 첨부 (마지막 ~3500자).
 
 프리셋(.noti.preset):
   - 위치: $NOTI_PRESET 또는 ./.noti.preset 또는 ~/.noti.preset
@@ -410,6 +683,7 @@ noti — Discord Webhook 통합 Bash 알림
   - 템플릿 안에서 $1 $2 ... $@ 사용 가능 (git alias 느낌)
   - 예약어: send, embed, file, run, help, -h, --help 는 프리셋 이름으로 사용 불가
   - 사용: noti <이름> <args...>
+  - 동일 preset 파일이 Discord/Slack 모두에서 동작합니다 (NOTI_WEBHOOK URL 로 provider 자동 결정).
 
 설정(.noti.conf):
   - 위치: $NOTI_CONFIG 또는 ./.noti.conf 또는 ~/.noti.conf
@@ -422,7 +696,8 @@ noti — Discord Webhook 통합 Bash 알림
   tarball = run --title "Tar $1" -- bash -lc 'tar -czf "$2" ${@:3}'
 
 예시 .noti.conf:
-  webhook = https://discord.com/api/webhooks/xxx/yyy
+  webhook = https://discord.com/api/webhooks/xxx/yyy   # 또는
+  webhook = https://hooks.slack.com/services/xxx/yyy/zzz
 
 예시 사용:
   noti deploy "배포 성공" v1.2.3
@@ -438,6 +713,14 @@ HLP
 # ---- 디스패처 (내장 서브커맨드 실행) ----
 noti_dispatch() {
   local subcmd="$1"; shift || true
+  case "$subcmd" in
+    help|--help|-h)
+      print_help
+      return 0
+      ;;
+  esac
+  # help 가 아닌 경로는 모두 webhook 필요. provider 도 여기서 결정됨.
+  ensure_webhook_or_die
   case "$subcmd" in
     send)
       local allow=false
@@ -455,9 +738,6 @@ noti_dispatch() {
       ;;
     run)
       run_and_alert "$@"
-      ;;
-    help|--help|-h)
-      print_help
       ;;
     *)
       echo "알 수 없는 명령: $subcmd" >&2

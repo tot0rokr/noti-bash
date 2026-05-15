@@ -1,20 +1,39 @@
-# noti — Discord Webhook 통합 Bash 알림
+# noti — Discord/Slack Webhook 통합 Bash 알림
 
-작업 결과를 **Discord Webhook**으로 보내는 단일 바이너리(스크립트).  
+작업 결과를 **Discord/Slack Webhook**으로 보내는 단일 바이너리(스크립트).  
 텍스트/임베드/파일 업로드/명령 실행 결과 요약을 전송하고, **프리셋(.noti.preset)** 으로 커맨드를 짧게 별칭처럼 쓸 수 있어.
+
+> Webhook URL 에서 **provider 를 자동 감지**합니다 (`discord.com/api/webhooks/...` → Discord, `hooks.slack.com/services/...` → Slack). 동일한 CLI/플래그/preset 파일이 양쪽 모두에서 동작합니다.
 
 ---
 
 ## 특징 (Features)
 
-- `send` 텍스트, `embed` 카드, `file` 업로드, `run` 실행/요약 전송 지원
+- **Discord & Slack 동시 지원**: webhook URL 로 자동 감지, 동일한 CLI/preset/플래그
+- `send` 텍스트, `embed` 카드, `file` 업로드(Discord), `run` 실행/요약 전송 지원
 - **프리셋(.noti.preset)**: `noti <이름> <args...>` 로 재사용 (git alias 느낌, `$1 $2 $@` 자리표시자)
 - 성공/실패/소요시간/시작/종료 시각 자동 포함 (run)
-- 로그 파일 자동 첨부 옵션(실패시에만/항상)
-- **멘션 차단 기본값**, `--allow-mentions`로 필요한 경우만 허용
-- **429 rate limit** 자동 재시도, **5xx** 지수 백오프
+- 로그 파일 자동 첨부 옵션(실패시에만/항상) — Slack 에서는 인라인 코드블록으로 fallback
+- **Discord 멘션 차단 기본값**, `--allow-mentions`로 필요한 경우만 허용
+- **429 rate limit** 자동 재시도(Discord: body `retry_after`, Slack: `Retry-After` 헤더), **5xx** 지수 백오프
 - **디버그 모드**(마스킹된 URL, 페이로드 프리뷰)
 - Linux/macOS/WSL에서 동작(표준 `bash`, `curl` 필요), `jq` 설치 시 임베드 품질↑
+
+---
+
+## Provider 지원 매트릭스
+
+| 기능                       | Discord | Slack |
+|----------------------------|:-------:|:-----:|
+| `send` (텍스트)            |   ✅    |  ✅   |
+| `embed` (제목/설명/색/필드)|   ✅    |  ✅   |
+| `file` (파일 업로드)       |   ✅    |  ❌   |
+| `run` (요약 임베드)        |   ✅    |  ✅   |
+| `--attach-log[-on-fail]`   |   ✅    | ⚠️ 인라인 코드블록 fallback |
+| `--allow-mentions`         |   ✅    | ⚠️ no-op |
+| 자동 rate-limit 재시도     |   ✅    |  ✅   |
+
+> Slack 의 파일 업로드/스레드 댓글은 Bot Token + `chat.postMessage`/`files.upload` 가 필요하므로 v1 범위 밖입니다. 코드에 `TODO(slack-bot-token)` 주석으로 확장 지점만 남겨두었습니다.
 
 ---
 
@@ -40,14 +59,17 @@ noti help
 ## 빠른 시작 (Quick Start)
 
 ```bash
-# 1) Webhook 설정 (환경변수 or .noti.conf 중 하나)
-export NOTI_WEBHOOK='https://discord.com/api/webhooks/.../...'
+# 1) Webhook 설정 (환경변수 or .noti.conf 중 하나). 둘 중 하나만 쓰면 됨.
+export NOTI_WEBHOOK='https://discord.com/api/webhooks/.../...'   # Discord
+# 또는
+export NOTI_WEBHOOK='https://hooks.slack.com/services/.../.../...'  # Slack
 
 # 2) 간단 메시지
 noti send "hello from noti 👋"
 
-# 3) 임베드(색/필드)
+# 3) 임베드(색/필드) — 색상은 10진수/hex/0x표기 모두 OK
 noti embed --title "Deploy" --desc "✅ Success" --color 3066993   --field Service api --field Version v1.2.3
+noti embed --title "Deploy" --desc "✅ Success" --color "#2ecc71" --field Service api --field Version v1.2.3
 
 # 4) 명령 실행 후 결과 전송 (실패 시 로그 첨부)
 noti run --title "CI: test" --attach-log-on-fail -- bash -c 'echo ok; exit 1'
@@ -64,14 +86,15 @@ noti run --title "CI: test" --attach-log-on-fail -- bash -c 'echo ok; exit 1'
    - 탐색 순서: `$NOTI_CONFIG` → `./.noti.conf` → `~/.noti.conf`
    - 포맷(택1 키):  
      ```ini
-     webhook = https://discord.com/api/webhooks/xxx/yyy
+     webhook = https://discord.com/api/webhooks/xxx/yyy          # Discord
      # 또는
-     NOTI_WEBHOOK = https://discord.com/api/webhooks/xxx/yyy
-     # 또는
-     webhook_url = https://discord.com/api/webhooks/xxx/yyy
+     webhook = https://hooks.slack.com/services/xxx/yyy/zzz       # Slack
+     # NOTI_WEBHOOK = / webhook_url = 키도 동일하게 인식됨
      ```
 
-> **보안 팁**: Webhook URL은 **토큰**. 저장소에 커밋 금지. 노출 시 Discord에서 재발급/기존 삭제 권장.
+> Provider 는 URL 패턴으로 자동 판별됩니다. 패턴에 매칭되지 않는 URL 은 exit code 2 와 함께 거부합니다.
+
+> **보안 팁**: Webhook URL은 **토큰**. 저장소에 커밋 금지. 노출 시 Discord/Slack 에서 재발급/기존 삭제 권장.
 
 ### 2) 프리셋 파일 `.noti.preset`
 
@@ -102,12 +125,12 @@ noti run --title "CI: test" --attach-log-on-fail -- bash -c 'echo ok; exit 1'
 
 ## 환경변수 (Environment Variables)
 
-- `NOTI_WEBHOOK` : Discord Webhook URL (최우선)
+- `NOTI_WEBHOOK` : Discord 또는 Slack incoming webhook URL (최우선)
 - `NOTI_CONFIG`  : `.noti.conf` 경로 강제
 - `NOTI_PRESET`  : `.noti.preset` 경로 강제
 - `NOTI_DEBUG`   : 디버그 레벨
   - `0` 또는 unset: 끔
-  - `1`: 기본 디버그(시도/HTTP 코드/재시도/백오프, URL 마스킹)
+  - `1`: 기본 디버그(provider/시도/HTTP 코드/재시도/백오프, URL 마스킹)
   - `2`: + 페이로드 앞 200자 프리뷰
 
 예:
@@ -128,12 +151,14 @@ noti send [--allow-mentions] <message...>
 ``)
 
 **옵션**
-- `--allow-mentions` : 멘션 허용(기본 차단: `@everyone`, `@here` 안 울림)
+- `--allow-mentions` : Discord 한정. 멘션 허용(기본 차단: `@everyone`, `@here` 안 울림).
+  Slack incoming webhook 은 평문 `@channel`을 멘션으로 변환하지 않으므로 이 플래그는 Slack 에서 no-op.
 
 **예시**
 ```bash
 noti send "배포 시작"
-noti send --allow-mentions "@here 배포 시작"
+noti send --allow-mentions "@here 배포 시작"          # Discord
+noti send "<!channel> 배포 시작"                      # Slack 에서 채널 멘션을 원하면 본문에 <!channel>
 ```
 
 ---
@@ -142,23 +167,30 @@ noti send --allow-mentions "@here 배포 시작"
 
 **형식**
 ```bash
-noti embed --title <t> --desc <d> [--color <int>]   [--field <name> <value>]... [--allow-mentions]
+noti embed --title <t> --desc <d> [--color <c>]   [--field <name> <value>]... [--allow-mentions]
 ```
 
 **설명**
-- `--color` 는 10진수(예: 초록 `3066993`, 빨강 `15158332`, 파랑 `3447003`)
-- `--field` 는 여러 번 사용 가능 (inline=true로 표시)
+- `--color` 는 다음 형식 모두 허용:
+  - 10진수: `3066993` (초록), `15158332` (빨강), `3447003` (파랑)
+  - hex: `#2ecc71`, `#e74c3c`
+  - 0x 표기: `0x2ecc71`
+  - Discord 에서는 10진수, Slack 에서는 `#rrggbb` 로 변환되어 attachment 의 색상 사이드바로 표시됨.
+- `--field` 는 여러 번 사용 가능 (Discord: `inline=true`, Slack: `short=true`)
 
 **예시**
 ```bash
 noti embed   --title "Build Result"   --desc "✅ Success"   --color 3066993   --field Branch main   --field Duration "12m 3s"
+noti embed   --title "Build Result"   --desc "✅ Success"   --color "#2ecc71" --field Branch main   --field Duration "12m 3s"
 ```
 
 > `jq` 없으면 간소 텍스트로 폴백됨.
 
+> **Markdown 차이**: Discord 는 `**bold**`/`~~strike~~`, Slack 은 `*bold*`/`~strike~`. 본문은 자동 변환하지 않으니 대상에 맞춰 작성하세요.
+
 ---
 
-### 3) `file` — 파일 업로드
+### 3) `file` — 파일 업로드 (Discord 전용)
 
 **형식**
 ```bash
@@ -168,6 +200,7 @@ noti file <path> [--message <m>] [--allow-mentions]
 **설명**
 - 멀티파트 업로드(`file1=@<path>`). Discord **업로드 제한 정책**에 따름.
 - `--message` 로 캡션 텍스트 동봉
+- **Slack 에서는 지원되지 않습니다.** Slack incoming webhook 은 파일 업로드를 받지 않으므로 호출 시 `exit 2` 와 함께 명확한 에러를 출력합니다. Slack 에서 로그를 보내고 싶다면 `noti run --attach-log` 의 인라인 fallback 을 사용하거나, 별도로 파일을 공유 채널/스토리지에 올린 뒤 `noti send` 로 링크를 게시하세요.
 
 **예시**
 ```bash
@@ -191,6 +224,7 @@ noti run [--title <t>] [--attach-log] [--attach-log-on-fail]   [--allow-mentions
 - `--attach-log`           : 항상 실행 로그 첨부
 - `--attach-log-on-fail`   : 실패시에만 로그 첨부
 - `jq` 있으면 임베드 카드로 요약, 없으면 텍스트
+- **Slack 에서 `--attach-log[-on-fail]`**: 로그 파일 업로드 대신 **마지막 ~3500자를 인라인 코드블록**으로 후속 메시지에 첨부합니다 (Slack incoming webhook 은 `thread_ts` 를 받지 못해 진짜 스레드 댓글은 불가).
 
 **예시**
 ```bash
@@ -254,10 +288,15 @@ export NOTI_DEBUG=2   # + 페이로드 프리뷰(앞 200자)
 
 ## 레이트 리밋/에러 처리
 
-- **204**: 성공(Discord Webhook은 본문 없이 204 반환)
-- **429**: `retry_after` 만큼 자동 대기 후 재시도
-- **5xx**: 지수 백오프 재시도
-- 그 외: STDERR로 코드/본문 출력 후 실패 반환
+| 항목 | Discord | Slack |
+|---|---|---|
+| 성공 응답 | HTTP **204** (본문 없음) | HTTP **200** (본문 `ok`) |
+| 429 대기 시간 출처 | 응답 body 의 `retry_after` 필드 (초; ms 단위 큰 값은 자동 보정) | 응답 헤더 `Retry-After` (초) |
+| 5xx | 1~5초 지수 백오프 자동 재시도 | 동일 |
+| 알 수 없는 URL | `ensure_webhook_or_die` 가 exit 2 | 동일 |
+| 알 수 없는 HTTP 코드 | STDERR 로 코드/본문 출력 후 실패 반환 | 동일 |
+
+재시도 한도는 `post_json` 의 기본 `max_retry=5`. 초과 시 stderr 에 `재시도 한도 초과` 출력 후 실패 반환.
 
 ---
 
@@ -272,7 +311,7 @@ export NOTI_DEBUG=2   # + 페이로드 프리뷰(앞 200자)
 
 ## CI/CD 예시
 
-**GitHub Actions**
+**GitHub Actions** (Discord)
 ```yaml
 - name: Notify
   run: |
@@ -280,10 +319,19 @@ export NOTI_DEBUG=2   # + 페이로드 프리뷰(앞 200자)
     NOTI_WEBHOOK="${{ secrets.DISCORD_WEBHOOK }}" noti file build.log --message "빌드 로그"
 ```
 
+**GitHub Actions** (Slack — `noti file` 대신 `run --attach-log` 사용)
+```yaml
+- name: Notify
+  env:
+    NOTI_WEBHOOK: ${{ secrets.SLACK_WEBHOOK }}
+  run: |
+    noti run --title "CI: build" --attach-log-on-fail -- make build
+```
+
 **GitLab CI**
 ```yaml
 script:
-  - export NOTI_WEBHOOK="$DISCORD_WEBHOOK"
+  - export NOTI_WEBHOOK="$CI_NOTI_WEBHOOK"  # Discord 또는 Slack URL
   - noti run --title "CI: test" --attach-log-on-fail -- make test
 ```
 
@@ -295,34 +343,41 @@ script:
 **Makefile**
 ```makefile
 notify:
-	NOTI_WEBHOOK=$(DISCORD_WEBHOOK) noti send "make notify"
+	NOTI_WEBHOOK=$(NOTI_WEBHOOK) noti send "make notify"
 ```
 
 ---
 
-## 문제 해결(Trbleshooting)
+## 문제 해결(Troubleshooting)
 
-- `NOTI_WEBHOOK 가 비어있음`  
+- `NOTI_WEBHOOK 이 설정되지 않았고 ...`  
   → `export NOTI_WEBHOOK=...` 또는 `.noti.conf`에 `webhook = ...` 추가
+- `Unrecognized webhook URL provider.`  
+  → URL 이 Discord/Slack 패턴(`discord.com/api/webhooks/...` 또는 `hooks.slack.com/services/...`) 에 맞지 않음. 오탈자/리다이렉트 도메인 확인.
+- `Slack incoming webhook 은 파일 업로드를 지원하지 않습니다.`  
+  → Slack URL 로는 `noti file` 사용 불가. `noti run --attach-log` 의 인라인 fallback 사용 또는 별도 스토리지에 파일 올려 링크 게시.
 - `임베드가 텍스트로만 보임`  
   → `jq` 설치 필요
 - **공백/따옴표 인자 깨짐**  
   → 프리셋 템플릿에서 반드시 `"${1}"` 식으로 따옴표 사용
 - `알 수 없는 명령 또는 프리셋 없음`  
   → `.noti.preset` 경로/오탈자 확인. `NOTI_PRESET`로 위치 강제 가능.
-- 반응 없음  
+- Discord 반응 없음  
   → 성공 시 204라 터미널 출력이 없음. 채널에서 도착 확인 + `NOTI_DEBUG=1`로 재시도.
+- Slack `invalid_payload`  
+  → 디버그 모드(`NOTI_DEBUG=2`)로 payload 프리뷰 확인. 빈 `text` + 빈 `attachments` 조합은 Slack 이 거부함.
 
 ---
 
 ## 반환값 요약
 
-- `send|embed|file`: HTTP 204이면 **0**, 그 외 실패 시 **1**
+- `send|embed`: 성공 응답(Discord 204 / Slack 200)이면 **0**, 그 외 실패 시 **1**
+- `file`: Discord 204 이면 **0**, 실패 시 **1**, Slack URL 에 대해 호출하면 **2** (미지원)
 - `run`: **실행한 명령의 exit code** 그대로 반환
 
 ---
 
-## 라이선스 / 크레딧
+## 라이선스
 
-- 사내/개인 자동화용 스크립트 성격. 별도 라이선스가 필요하면 README 하단에 추가하면 돼.
+[BSD 3-Clause License](./LICENSE). 자유롭게 수정/재배포 가능. 자세한 조건은 `LICENSE` 파일 참고.
 

@@ -1,5 +1,11 @@
 # 한 줄에 하나, "이름 = 템플릿" 또는 "이름: 템플릿"
 # 템플릿 안에서 $1 $2 ... $@ 사용 가능 (git alias 스타일)
+#
+# 동일한 preset 파일이 Discord/Slack 모두에서 동작합니다.
+# Provider 는 NOTI_WEBHOOK URL 로 자동 감지됩니다.
+# --color 는 10진수(3066993), hex(#2ecc71), 0x표기(0x2ecc71) 모두 허용.
+# Slack 에서는 `file` 서브커맨드/`--attach-log` 파일 업로드가 지원되지 않습니다
+#   (--attach-log 는 인라인 코드블록 fallback 으로 동작).
 
 # 예: 배포 결과를 embed로 보내기 (인자: 메시지, 버전)
 deploy = embed --title "Deploy" --desc "$1" --color 3066993 --field Service api --field Version "$2"
