@@ -76,17 +76,65 @@
 
 ## 설치
 
+### 빠른 설치 (`./install`, fzf 스타일)
+
+repo 안의 `install` 스크립트가 PATH 추가 + Claude Code skill 연결을 한 번에 처리합니다.
+
 ```bash
-# 1) 시스템 전역 설치 (권장)
+git clone https://github.com/tot0rokr/noti-bash.git ~/.noti-bash
+~/.noti-bash/install
+```
+
+스크립트가 하는 일:
+
+- `<repo>/bin` 을 shell rc(`~/.bashrc` 또는 `~/.zshrc`, `$SHELL` 로 자동 감지) 안 **`# noti-bash` 블록**에 PATH 로 추가
+- (대화형 프롬프트) Claude Code skill 을 `~/.claude/skills/noti` 로 symlink
+- 이미 적용된 부분은 idempotent 하게 skip
+
+비대화 옵션:
+
+```bash
+~/.noti-bash/install --all          # 묻지 않고 PATH + skill 모두 설치
+~/.noti-bash/install --no-skill     # PATH 만, skill 은 건너뜀
+~/.noti-bash/install --rc ~/.zshrc  # rc 파일을 직접 지정 (자동 감지 무시)
+~/.noti-bash/install -h             # 도움말
+```
+
+설치 후 새 shell 열거나 `source ~/.bashrc` 를 한 번 실행하면 `noti help` 가 동작합니다.
+
+### 수동 설치
+
+install 스크립트를 쓰지 않고 직접:
+
+```bash
+# 시스템 전역
 sudo install -m 0755 noti /usr/local/bin/noti
 
-# 또는 사용자 영역에 설치 (PATH 에 ~/.local/bin 포함되어 있어야 함)
+# 또는 사용자 영역 (PATH 에 ~/.local/bin 포함되어 있어야 함)
 install -m 0755 noti ~/.local/bin/noti
 
-# 2) 개발용 symlink (편집이 즉시 PATH 에 반영됨)
+# 개발 중 — 편집이 즉시 PATH 에 반영됨
 ln -sf "$PWD/noti" ~/.local/bin/noti
+```
 
-# 실행 확인
+Claude Code skill 도 수동으로 연결할 수 있습니다:
+
+```bash
+mkdir -p ~/.claude/skills
+ln -s "$PWD/skills/noti" ~/.claude/skills/noti
+```
+
+### 제거
+
+```bash
+~/.noti-bash/install --uninstall
+```
+
+위 명령은 rc 파일의 `# noti-bash` 블록을 제거하고, install 스크립트가 만든 skill symlink 를 끊습니다. repo 디렉터리 자체는 안 건드리므로 필요 없으면 `rm -rf ~/.noti-bash` 로 따로 삭제하세요.
+
+### 실행 확인
+
+```bash
 noti help
 ```
 
@@ -96,15 +144,7 @@ noti help
 
 `skills/noti/SKILL.md` 가 함께 포함되어 있어, Claude Code 사용자라면 "이 빌드 결과 슬랙으로 알려" / "디스코드로 알림 보내" 같은 자연어 트리거로 LLM 이 `noti` CLI 를 자동 호출하게 만들 수 있습니다.
 
-설치 (skill 디렉터리를 Claude Code 가 인식하는 경로로 symlink):
-
-```bash
-# user-level skill 디렉터리에 연결
-mkdir -p ~/.claude/skills
-ln -s "$PWD/skills/noti" ~/.claude/skills/noti
-```
-
-`~/.claude/skills` 가 dotfiles repo 의 다른 경로로 symlink 되어 있다면 그 실제 경로에 링크하세요. 설치 후 Claude Code 세션이 자동으로 skill 을 picks up 합니다 (재시작 불필요).
+`./install` 스크립트로 자동 연결되거나, 위 "수동 설치" 의 마지막 블록으로 직접 link 할 수 있습니다 (`~/.claude/skills/noti` → `repo/skills/noti`). 설치 후 Claude Code 세션이 자동으로 skill 을 picks up 합니다 (재시작 불필요).
 
 전제 조건:
 - `noti` 가 PATH 에 있을 것 (위 §설치 참고)

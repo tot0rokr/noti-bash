@@ -1,0 +1,159 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: BSD-3-Clause
+# noti-bash installer — fzf-style.
+#
+# What it does:
+#   1. Appends "export PATH=<repo>/bin:$PATH" to your shell rc file
+#      (~/.bashrc or ~/.zshrc, auto-detected) inside a "# noti-bash" block.
+#   2. Optionally symlinks skills/noti into ~/.claude/skills/noti so
+#      Claude Code picks up the natural-language trigger skill.
+#   3. Idempotent — re-running skips parts already installed.
+#
+# Usage:
+#   ./install                # interactive
+#   ./install --all          # non-interactive: PATH + skill
+#   ./install --no-skill     # PATH only, no skill
+#   ./install --rc PATH      # use this shell rc file (skip auto-detect)
+#   ./install --uninstall    # remove PATH block and skill symlink
+#   ./install -h | --help
+
+set -Eeuo pipefail
+
+REPO_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+BIN_DIR="$REPO_DIR/bin"
+MARKER="# noti-bash"
+SKILL_LINK="$HOME/.claude/skills/noti"
+
+INSTALL_SKILL="ask"   # ask | yes | no
+SHELL_RC=""
+MODE="install"        # install | uninstall
+
+log() { printf '[noti-bash] %s\n' "$*"; }
+err() { printf '[noti-bash] %s\n' "$*" >&2; }
+
+usage() {
+  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' | head -25
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --all)        INSTALL_SKILL=yes; shift ;;
+    --no-skill)   INSTALL_SKILL=no;  shift ;;
+    --rc)         SHELL_RC="${2:?--rc needs a path}"; shift 2 ;;
+    --uninstall)  MODE=uninstall;    shift ;;
+    -h|--help)    usage; exit 0 ;;
+    *)            err "unknown arg: $1"; usage >&2; exit 1 ;;
+  esac
+done
+
+detect_rc() {
+  case "${SHELL:-}" in
+    */zsh)  echo "$HOME/.zshrc" ;;
+    */bash) echo "$HOME/.bashrc" ;;
+    *)      echo "$HOME/.bashrc" ;;
+  esac
+}
+[[ -z "$SHELL_RC" ]] && SHELL_RC="$(detect_rc)"
+
+ensure_bin_symlink() {
+  mkdir -p "$BIN_DIR"
+  if [[ ! -e "$BIN_DIR/noti" && ! -L "$BIN_DIR/noti" ]]; then
+    ln -s ../noti "$BIN_DIR/noti"
+    log "Created $BIN_DIR/noti -> ../noti"
+  fi
+}
+
+append_path_block() {
+  touch "$SHELL_RC"
+  if grep -qF "$MARKER" "$SHELL_RC"; then
+    log "PATH already configured in $SHELL_RC (marker '$MARKER' present)."
+    return
+  fi
+  {
+    printf '\n%s\n' "$MARKER"
+    printf 'export PATH="%s:$PATH"\n' "$BIN_DIR"
+  } >> "$SHELL_RC"
+  log "Appended PATH block to $SHELL_RC"
+}
+
+remove_path_block() {
+  [[ -f "$SHELL_RC" ]] || { log "No $SHELL_RC to clean."; return; }
+  if ! grep -qF "$MARKER" "$SHELL_RC"; then
+    log "No noti-bash block found in $SHELL_RC."
+    return
+  fi
+  # Remove the marker line plus the immediately-following PATH line and
+  # one leading blank line if present.
+  local tmp
+  tmp="$(mktemp)"
+  awk -v marker="$MARKER" '
+    BEGIN { skip = 0; pending_blank = 0 }
+    {
+      if ($0 == marker)                 { skip = 1; next }
+      if (skip && $0 ~ /^export PATH=/) { skip = 0; next }
+      if (skip)                         { skip = 0 }
+      print
+    }
+  ' "$SHELL_RC" > "$tmp"
+  # Collapse double blank lines that may result.
+  awk 'BEGIN{prev_blank=0} { if ($0=="") { if (prev_blank) next; prev_blank=1 } else prev_blank=0; print }' "$tmp" > "$SHELL_RC"
+  rm -f "$tmp"
+  log "Removed noti-bash block from $SHELL_RC"
+}
+
+install_skill() {
+  mkdir -p "$(dirname "$SKILL_LINK")"
+  if [[ -L "$SKILL_LINK" || -e "$SKILL_LINK" ]]; then
+    local cur
+    cur="$(readlink -f "$SKILL_LINK" 2>/dev/null || true)"
+    if [[ "$cur" == "$REPO_DIR/skills/noti" ]]; then
+      log "Skill already linked: $SKILL_LINK -> $REPO_DIR/skills/noti"
+    else
+      log "$SKILL_LINK already exists (resolves to $cur) — leaving it alone."
+    fi
+    return
+  fi
+  ln -s "$REPO_DIR/skills/noti" "$SKILL_LINK"
+  log "Linked $SKILL_LINK -> $REPO_DIR/skills/noti"
+}
+
+remove_skill() {
+  if [[ -L "$SKILL_LINK" ]]; then
+    rm -f "$SKILL_LINK"
+    log "Removed $SKILL_LINK"
+  elif [[ -e "$SKILL_LINK" ]]; then
+    log "$SKILL_LINK is not a symlink — leaving it alone."
+  else
+    log "No skill symlink at $SKILL_LINK."
+  fi
+}
+
+prompt_skill() {
+  printf '[noti-bash] Install Claude Code skill (%s)? [Y/n] ' "$SKILL_LINK"
+  local ans
+  read -r ans || ans=""
+  case "${ans,,}" in
+    ""|y|yes) INSTALL_SKILL=yes ;;
+    *)        INSTALL_SKILL=no  ;;
+  esac
+}
+
+case "$MODE" in
+  install)
+    ensure_bin_symlink
+    append_path_block
+    if [[ "$INSTALL_SKILL" == "ask" ]]; then
+      if [[ -t 0 ]]; then prompt_skill; else INSTALL_SKILL=no; fi
+    fi
+    [[ "$INSTALL_SKILL" == "yes" ]] && install_skill || log "Skipped skill install."
+    echo
+    log "Done. Open a new shell, or run:  source $SHELL_RC"
+    log "Then:  noti help"
+    ;;
+  uninstall)
+    remove_path_block
+    remove_skill
+    echo
+    log "Uninstalled. The repo itself ($REPO_DIR) is untouched — delete it manually if you no longer need it."
+    ;;
+esac
