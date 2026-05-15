@@ -3,44 +3,63 @@
 # noti-bash installer — fzf-style.
 #
 # What it does:
-#   1. Appends "export PATH=<repo>/bin:$PATH" to your shell rc file
-#      (~/.bashrc or ~/.zshrc, auto-detected) inside a "# noti-bash" block.
+#   1. Appends a managed block to your shell rc (~/.bashrc or ~/.zshrc,
+#      auto-detected) bracketed by:
+#          # >>> noti-bash >>>
+#          export PATH="<repo>/bin:$PATH"
+#          export NOTI_WEBHOOK="..."     # optional
+#          # <<< noti-bash <<<
 #   2. Optionally symlinks skills/noti into ~/.claude/skills/noti so
 #      Claude Code picks up the natural-language trigger skill.
-#   3. Idempotent — re-running skips parts already installed.
+#   3. Optionally prompts for a Discord/Slack webhook URL and writes it
+#      into the same block. Skipping the prompt prints short manual
+#      instructions and points at README.md's "Webhook 발급받기".
+#   4. Idempotent — re-running replaces the managed block with the
+#      desired content (no duplicates).
 #
 # Usage:
-#   ./install                # interactive
-#   ./install --all          # non-interactive: PATH + skill
-#   ./install --no-skill     # PATH only, no skill
-#   ./install --rc PATH      # use this shell rc file (skip auto-detect)
-#   ./install --uninstall    # remove PATH block and skill symlink
+#   ./install                       # interactive
+#   ./install --all                 # non-interactive: PATH + skill (no webhook)
+#   ./install --no-skill            # PATH only, no skill prompt
+#   ./install --no-webhook          # skip webhook prompt entirely
+#   ./install --webhook URL         # set webhook non-interactively
+#   ./install --rc PATH             # use this rc file (skip auto-detect)
+#   ./install --uninstall           # remove the managed block and skill symlink
 #   ./install -h | --help
 
 set -Eeuo pipefail
 
 REPO_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
 BIN_DIR="$REPO_DIR/bin"
-MARKER="# noti-bash"
+README_ANCHOR="$REPO_DIR/README.md#webhook-발급받기"
+
+BEGIN_MARKER='# >>> noti-bash >>>'
+END_MARKER='# <<< noti-bash <<<'
+LEGACY_MARKER='# noti-bash'   # earlier installs used a single marker
+
 SKILL_LINK="$HOME/.claude/skills/noti"
 
-INSTALL_SKILL="ask"   # ask | yes | no
+INSTALL_SKILL="ask"     # ask | yes | no
+INSTALL_WEBHOOK="ask"   # ask | yes | no
+WEBHOOK_URL=""
 SHELL_RC=""
-MODE="install"        # install | uninstall
+MODE="install"          # install | uninstall
 
 log() { printf '[noti-bash] %s\n' "$*"; }
 err() { printf '[noti-bash] %s\n' "$*" >&2; }
 
 usage() {
-  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' | head -25
+  sed -n '2,/^$/p' "$0" | sed 's/^# \{0,1\}//' | head -32
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --all)        INSTALL_SKILL=yes; shift ;;
-    --no-skill)   INSTALL_SKILL=no;  shift ;;
+    --all)        INSTALL_SKILL=yes;   INSTALL_WEBHOOK=no; shift ;;
+    --no-skill)   INSTALL_SKILL=no;    shift ;;
+    --no-webhook) INSTALL_WEBHOOK=no;  shift ;;
+    --webhook)    INSTALL_WEBHOOK=yes; WEBHOOK_URL="${2:?--webhook needs a URL}"; shift 2 ;;
     --rc)         SHELL_RC="${2:?--rc needs a path}"; shift 2 ;;
-    --uninstall)  MODE=uninstall;    shift ;;
+    --uninstall)  MODE=uninstall;      shift ;;
     -h|--help)    usage; exit 0 ;;
     *)            err "unknown arg: $1"; usage >&2; exit 1 ;;
   esac
@@ -55,6 +74,24 @@ detect_rc() {
 }
 [[ -z "$SHELL_RC" ]] && SHELL_RC="$(detect_rc)"
 
+mask_webhook() {
+  # Print a masked version of a webhook URL for confirmation messages.
+  printf '%s' "$1" | sed -E \
+    -e 's#(/api/webhooks/[^/]+/)[A-Za-z0-9_-]+#\1***#g' \
+    -e 's#(/services/[^/]+/[^/]+/)[A-Za-z0-9_-]+#\1***#g'
+}
+
+validate_webhook() {
+  case "$1" in
+    https://discord.com/api/webhooks/*|\
+    https://discordapp.com/api/webhooks/*|\
+    https://ptb.discord.com/api/webhooks/*|\
+    https://canary.discord.com/api/webhooks/*|\
+    https://hooks.slack.com/services/*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 ensure_bin_symlink() {
   mkdir -p "$BIN_DIR"
   if [[ ! -e "$BIN_DIR/noti" && ! -L "$BIN_DIR/noti" ]]; then
@@ -63,42 +100,113 @@ ensure_bin_symlink() {
   fi
 }
 
-append_path_block() {
-  touch "$SHELL_RC"
-  if grep -qF "$MARKER" "$SHELL_RC"; then
-    log "PATH already configured in $SHELL_RC (marker '$MARKER' present)."
-    return
-  fi
-  {
-    printf '\n%s\n' "$MARKER"
-    printf 'export PATH="%s:$PATH"\n' "$BIN_DIR"
-  } >> "$SHELL_RC"
-  log "Appended PATH block to $SHELL_RC"
+remove_block() {
+  [[ -f "$SHELL_RC" ]] || return 0
+  local tmp; tmp="$(mktemp)"
+  # 1) Remove modern bracketed block.
+  awk -v b="$BEGIN_MARKER" -v e="$END_MARKER" '
+    $0 == b { skip = 1; next }
+    skip && $0 == e { skip = 0; next }
+    skip { next }
+    { print }
+  ' "$SHELL_RC" > "$tmp"
+  # 2) Remove legacy single-marker block (marker line + following export line).
+  awk -v m="$LEGACY_MARKER" '
+    BEGIN { skip = 0 }
+    $0 == m { skip = 1; next }
+    skip && $0 ~ /^export (PATH|NOTI_WEBHOOK)=/ { skip = 0; next }
+    skip { skip = 0 }
+    { print }
+  ' "$tmp" > "$SHELL_RC"
+  # 3) Collapse runs of blank lines that may have been left behind.
+  awk 'BEGIN{p=0} { if ($0=="") { if (p) next; p=1 } else p=0; print }' "$SHELL_RC" > "$tmp"
+  mv "$tmp" "$SHELL_RC"
 }
 
-remove_path_block() {
-  [[ -f "$SHELL_RC" ]] || { log "No $SHELL_RC to clean."; return; }
-  if ! grep -qF "$MARKER" "$SHELL_RC"; then
-    log "No noti-bash block found in $SHELL_RC."
+build_block() {
+  printf '%s\n' "$BEGIN_MARKER"
+  printf 'export PATH="%s:$PATH"\n' "$BIN_DIR"
+  if [[ -n "$WEBHOOK_URL" ]]; then
+    printf 'export NOTI_WEBHOOK="%s"\n' "$WEBHOOK_URL"
+  fi
+  printf '%s\n' "$END_MARKER"
+}
+
+write_block() {
+  touch "$SHELL_RC"
+  local desired existing
+  desired="$(build_block)"
+  existing="$(awk -v b="$BEGIN_MARKER" -v e="$END_MARKER" '
+    $0 == b { capture = 1 }
+    capture { print }
+    $0 == e && capture { exit }
+  ' "$SHELL_RC")"
+
+  if [[ -n "$existing" && "$existing" == "$desired" ]]; then
+    log "noti-bash block in $SHELL_RC is already up to date."
     return
   fi
-  # Remove the marker line plus the immediately-following PATH line and
-  # one leading blank line if present.
-  local tmp
-  tmp="$(mktemp)"
-  awk -v marker="$MARKER" '
-    BEGIN { skip = 0; pending_blank = 0 }
-    {
-      if ($0 == marker)                 { skip = 1; next }
-      if (skip && $0 ~ /^export PATH=/) { skip = 0; next }
-      if (skip)                         { skip = 0 }
-      print
-    }
-  ' "$SHELL_RC" > "$tmp"
-  # Collapse double blank lines that may result.
-  awk 'BEGIN{prev_blank=0} { if ($0=="") { if (prev_blank) next; prev_blank=1 } else prev_blank=0; print }' "$tmp" > "$SHELL_RC"
-  rm -f "$tmp"
-  log "Removed noti-bash block from $SHELL_RC"
+
+  remove_block
+  printf '\n%s\n' "$desired" >> "$SHELL_RC"
+  if [[ -n "$WEBHOOK_URL" ]]; then
+    log "Wrote noti-bash block (PATH + NOTI_WEBHOOK) to $SHELL_RC"
+    log "  webhook: $(mask_webhook "$WEBHOOK_URL")"
+  else
+    log "Wrote noti-bash block (PATH only) to $SHELL_RC"
+  fi
+}
+
+print_manual_webhook_instructions() {
+  cat <<EOF
+
+[noti-bash] To set the webhook later, append one line to $SHELL_RC
+            (inside the noti-bash block, or anywhere) and reload:
+
+    export NOTI_WEBHOOK="<your-webhook-url>"
+
+[noti-bash] How to obtain a Discord/Slack webhook URL:
+            see README.md → "Webhook 발급받기"
+            ($README_ANCHOR)
+
+EOF
+}
+
+prompt_webhook() {
+  # Already in env? Don't overwrite unless the user explicitly asks.
+  if [[ -n "${NOTI_WEBHOOK:-}" ]]; then
+    log "NOTI_WEBHOOK is already set in the current environment — skipping prompt."
+    log "  (current: $(mask_webhook "$NOTI_WEBHOOK"))"
+    return
+  fi
+  # Already declared in rc? Skip too.
+  if [[ -f "$SHELL_RC" ]] && grep -qE '^export NOTI_WEBHOOK=' "$SHELL_RC"; then
+    log "NOTI_WEBHOOK already declared in $SHELL_RC — skipping prompt."
+    return
+  fi
+
+  echo
+  log "Optionally register your Discord/Slack webhook URL now."
+  log "It will be appended to $SHELL_RC inside the noti-bash block."
+  printf '[noti-bash] Paste webhook URL (leave blank to skip): '
+  local url
+  # -s for silent input — the URL is a credential.
+  read -r -s url || url=""
+  echo
+
+  if [[ -z "$url" ]]; then
+    print_manual_webhook_instructions
+    return
+  fi
+
+  if ! validate_webhook "$url"; then
+    err "URL does not match a Discord or Slack incoming-webhook pattern. Skipping."
+    print_manual_webhook_instructions
+    return
+  fi
+
+  WEBHOOK_URL="$url"
+  log "Webhook accepted: $(mask_webhook "$WEBHOOK_URL")"
 }
 
 install_skill() {
@@ -141,19 +249,43 @@ prompt_skill() {
 case "$MODE" in
   install)
     ensure_bin_symlink
-    append_path_block
+
+    # Skill prompt
     if [[ "$INSTALL_SKILL" == "ask" ]]; then
       if [[ -t 0 ]]; then prompt_skill; else INSTALL_SKILL=no; fi
     fi
-    [[ "$INSTALL_SKILL" == "yes" ]] && install_skill || log "Skipped skill install."
+
+    # Webhook prompt — runs before write_block so the URL can be folded in
+    if [[ "$INSTALL_WEBHOOK" == "ask" ]]; then
+      if [[ -t 0 ]]; then prompt_webhook; else INSTALL_WEBHOOK=no; fi
+    elif [[ "$INSTALL_WEBHOOK" == "yes" ]]; then
+      if ! validate_webhook "$WEBHOOK_URL"; then
+        err "--webhook value does not look like a Discord/Slack URL. Aborting."
+        exit 1
+      fi
+    fi
+
+    write_block
+
+    if [[ "$INSTALL_SKILL" == "yes" ]]; then
+      install_skill
+    else
+      log "Skipped skill install."
+    fi
+
+    if [[ "$INSTALL_WEBHOOK" == "no" && -z "$WEBHOOK_URL" ]]; then
+      print_manual_webhook_instructions
+    fi
+
     echo
     log "Done. Open a new shell, or run:  source $SHELL_RC"
     log "Then:  noti help"
     ;;
+
   uninstall)
-    remove_path_block
+    remove_block
     remove_skill
     echo
-    log "Uninstalled. The repo itself ($REPO_DIR) is untouched — delete it manually if you no longer need it."
+    log "Uninstalled. Repo dir ($REPO_DIR) is untouched — delete it manually if you no longer need it."
     ;;
 esac

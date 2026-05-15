@@ -87,17 +87,22 @@ git clone https://github.com/tot0rokr/noti-bash.git ~/.noti-bash
 
 스크립트가 하는 일:
 
-- `<repo>/bin` 을 shell rc(`~/.bashrc` 또는 `~/.zshrc`, `$SHELL` 로 자동 감지) 안 **`# noti-bash` 블록**에 PATH 로 추가
+- `<repo>/bin` 을 shell rc(`~/.bashrc` 또는 `~/.zshrc`, `$SHELL` 로 자동 감지) 안 `# >>> noti-bash >>>` ... `# <<< noti-bash <<<` 블록에 PATH 로 추가
 - (대화형 프롬프트) Claude Code skill 을 `~/.claude/skills/noti` 로 symlink
-- 이미 적용된 부분은 idempotent 하게 skip
+- (대화형 프롬프트) **Discord/Slack webhook URL 입력 받아 같은 블록에 `export NOTI_WEBHOOK="..."` 로 등록**
+  - 입력은 화면에 표시되지 않음 (credential 보호). URL 패턴이 Discord/Slack 이 아니면 거부.
+  - 비우고 Enter 치면 짧은 수동 안내 + [Webhook 발급받기](#webhook-발급받기) 섹션으로 안내
+- 이미 적용된 부분은 idempotent 하게 skip (블록 내용이 같으면 그대로, 다르면 통째로 교체)
 
 비대화 옵션:
 
 ```bash
-~/.noti-bash/install --all          # 묻지 않고 PATH + skill 모두 설치
-~/.noti-bash/install --no-skill     # PATH 만, skill 은 건너뜀
-~/.noti-bash/install --rc ~/.zshrc  # rc 파일을 직접 지정 (자동 감지 무시)
-~/.noti-bash/install -h             # 도움말
+~/.noti-bash/install --all                    # PATH + skill (webhook 은 묻지 않음)
+~/.noti-bash/install --no-skill               # PATH 만, skill 건너뜀
+~/.noti-bash/install --no-webhook             # webhook 프롬프트 건너뜀
+~/.noti-bash/install --webhook 'https://...'  # webhook 을 인자로 직접 등록
+~/.noti-bash/install --rc ~/.zshrc            # rc 파일 직접 지정
+~/.noti-bash/install -h                       # 도움말
 ```
 
 설치 후 새 shell 열거나 `source ~/.bashrc` 를 한 번 실행하면 `noti help` 가 동작합니다.
