@@ -58,7 +58,7 @@
 | `embed` (제목/설명/색/필드)|   ✅    |  ✅   |
 | `file` (파일 업로드)       |   ✅    |  ❌   |
 | `run` (요약 임베드)        |   ✅    |  ✅   |
-| `--attach-log[-on-fail]`   |   ✅    | ⚠️ 인라인 코드블록 fallback |
+| `--attach-log[-on-fail]`   | ✅ 임베드 + 파일 | ✅ 임베드 + 인라인 코드블록 |
 | `--allow-mentions`         |   ✅    | ⚠️ no-op |
 | 자동 rate-limit 재시도     |   ✅    |  ✅   |
 

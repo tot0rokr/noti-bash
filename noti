@@ -612,8 +612,20 @@ run_and_alert() {
     attach_now=true
   fi
 
-  if [[ "$attach_now" == true ]]; then
+  # 1) 요약 임베드(가능하면) 또는 한 줄 텍스트로 상태 항상 전송
+  if has_jq; then
+    local payload
+    case "$WEBHOOK_PROVIDER" in
+      discord) payload=$(_build_run_embed_discord "$title" "$icon" "$rc" "$dur_human" "$start_human" "$end_human" "$cmd_str" "$allow_mentions") ;;
+      slack)   payload=$(_build_run_embed_slack   "$title" "$icon" "$rc" "$dur_human" "$start_human" "$end_human" "$cmd_str" "$allow_mentions") ;;
+    esac
+    post_json "$payload"
+  else
     send_text "$base_msg" "$allow_mentions"
+  fi
+
+  # 2) --attach-log[-on-fail] 가 적용되면 로그를 추가로 전송 (Discord: 파일, Slack: 인라인 코드블록)
+  if [[ "$attach_now" == true ]]; then
     local caption
     if [[ $rc -ne 0 ]]; then caption="${title} log (FAIL)"; else caption="${title} log"; fi
     case "$WEBHOOK_PROVIDER" in
@@ -628,17 +640,6 @@ run_and_alert() {
         _attach_log_inline_slack "$log" "$caption"
         ;;
     esac
-  else
-    if has_jq; then
-      local payload
-      case "$WEBHOOK_PROVIDER" in
-        discord) payload=$(_build_run_embed_discord "$title" "$icon" "$rc" "$dur_human" "$start_human" "$end_human" "$cmd_str" "$allow_mentions") ;;
-        slack)   payload=$(_build_run_embed_slack   "$title" "$icon" "$rc" "$dur_human" "$start_human" "$end_human" "$cmd_str" "$allow_mentions") ;;
-      esac
-      post_json "$payload"
-    else
-      send_text "$base_msg" "$allow_mentions"
-    fi
   fi
 
   rm -f "$log"
