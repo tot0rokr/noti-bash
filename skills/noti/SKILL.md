@@ -31,6 +31,7 @@ Never paste the contents of `$NOTI_WEBHOOK` back to the user — the URL is a cr
 
 Pick the smallest subcommand that does the job.
 
+0. **A `.noti.preset` already covers this?** → `noti <preset-name> <args>`. Always check first — see "Presets" below.
 1. **Short one-line message?** → `noti send "..."`
 2. **Rich card with title / description / color / fields?** → `noti embed --title ... --desc ... --color ... --field K V ...`
 3. **Result of a build / test / deploy / migration?**
@@ -40,6 +41,35 @@ Pick the smallest subcommand that does the job.
 4. **File attachment?**
    - Discord: `noti file <path> --message "..."`
    - Slack: not supported. Inline the relevant snippet (last ~30 lines) inside a code block in `noti send` instead.
+
+## Presets (`.noti.preset`)
+
+Users often codify common notification shapes in a `.noti.preset` file. Lookup order: `$NOTI_PRESET` → `./.noti.preset` → `~/.noti.preset`. Each line is `name = template`; templates use `$1 $2 ... $@` like a git alias.
+
+**Before assembling a long inline command, check whether a preset already matches the user's intent:**
+
+```bash
+preset_file=${NOTI_PRESET:-}
+[[ -z "$preset_file" && -f ./.noti.preset ]] && preset_file=./.noti.preset
+[[ -z "$preset_file" && -f ~/.noti.preset ]] && preset_file=~/.noti.preset
+[[ -n "$preset_file" ]] && cat "$preset_file"
+```
+
+If a preset matches in shape (same kind of thing the user wants to say), prefer calling it:
+
+```bash
+noti deploy "✅ 배포 완료" v1.2.3       # preset 'deploy' → embed with service+version
+noti ping "서버 살아있음"                # preset 'ping' → simple send
+noti test-fail unit "make test"          # preset 'test-fail' → run + log on fail
+noti summary "Backup" "✅ OK" nightly db01  # preset 'summary' → embed with 4 fields
+noti ping-here "긴급 점검"               # preset 'ping-here' → send with @here
+```
+
+Notes:
+- Reserved names (cannot be presets): `send`, `embed`, `file`, `run`, `help`, `-h`, `--help`.
+- Argument substitution is shell-style — quote args containing spaces.
+- If the same inline pattern would clearly be reused, **suggest** adding a preset to the user. Do not edit `.noti.preset` without asking.
+- Presets that wrap `run` (e.g. `test-fail`) hide live stdout/stderr. Same caveat as in the decision tree — prefer running the command yourself and reporting via `send`/`embed` unless the user explicitly requests the preset.
 
 ## Color convention (`--color`)
 
@@ -105,6 +135,103 @@ EOF
 # Slack rejects `noti file`. Inline a tail of the log instead:
 log_tail=$(tail -n 30 build.log)
 noti send "$(printf 'Build log (tail):\n```\n%s\n```\n' "$log_tail")"
+```
+
+### Service deploy with version (matches `deploy` preset)
+
+```bash
+noti embed --title "Deploy" --desc "✅ 배포 완료" --color "#2ecc71" \
+  --field Service api --field Version v1.2.3
+```
+
+If the user has the `deploy` preset configured, the equivalent one-liner is:
+
+```bash
+noti deploy "✅ 배포 완료" v1.2.3
+```
+
+### CI/test run with log tail on failure (matches `test-fail` preset, inline)
+
+The `test-fail` preset wraps `noti run`, which hides live output. Prefer to run the command yourself and report:
+
+```bash
+log=$(mktemp); trap 'rm -f "$log"' EXIT
+if make test 2>&1 | tee "$log"; then
+  noti embed --title "CI: unit" --desc "✅ Pass" --color "#2ecc71" \
+    --field Duration "${SECONDS}s"
+else
+  rc=${PIPESTATUS[0]}
+  noti embed --title "CI: unit" --desc "❌ Fail (exit=$rc)" --color "#e74c3c" \
+    --field "Last lines" "$(printf '```\n%s\n```' "$(tail -n 10 "$log")")"
+fi
+```
+
+### Multi-field summary card (matches `summary` preset)
+
+```bash
+noti embed --title "Nightly Backup" --desc "✅ OK" --color "#3498db" \
+  --field Tag nightly \
+  --field Host db01 \
+  --field Duration "$(date -ud@$SECONDS '+%-Mm %-Ss')" \
+  --field Size "12.4 GB"
+```
+
+### Long task with elapsed time
+
+```bash
+start=$(date +%s)
+./long-script.sh
+elapsed=$(( $(date +%s) - start ))
+noti embed --title "Migration" --desc "완료" --color "#2ecc71" \
+  --field Elapsed "$((elapsed/60))m $((elapsed%60))s" \
+  --field Records "$(wc -l < migrated.csv)"
+```
+
+### Git-context-rich report (hotfix / release)
+
+```bash
+noti embed --title "Hotfix deployed" --desc "$1" --color "#f1c40f" \
+  --field Branch "$(git rev-parse --abbrev-ref HEAD)" \
+  --field Commit "$(git rev-parse --short HEAD)" \
+  --field Author "$(git log -1 --format='%an')" \
+  --field Tag   "$(git describe --tags --abbrev=0 2>/dev/null || echo untagged)"
+```
+
+### Conditional notification (skip on user interrupt)
+
+```bash
+make build || {
+  rc=$?
+  # 130 = SIGINT (Ctrl+C). Don't ping the channel for user-cancelled runs.
+  [[ $rc -ne 130 ]] && noti send "❌ Build failed (exit=$rc) on $(hostname)"
+  exit $rc
+}
+```
+
+### Batched report instead of N pings
+
+When you have multiple things to report in a row, fold them into one embed rather than spamming N messages (rate-limit friendly):
+
+```bash
+noti embed --title "Nightly batch" --desc "$(date '+%F')" --color "#3498db" \
+  --field "DB backup"    "✅ 12.4 GB / 2m 11s" \
+  --field "Log rotation" "✅ 14 files" \
+  --field "Index rebuild" "⚠️ skipped (locked)" \
+  --field "Cache warm"   "✅ 234 keys"
+```
+
+### Step-by-step progress on a long workflow
+
+For a multi-stage pipeline where intermediate status matters, send sparse updates — start, midpoint, end — not one per step:
+
+```bash
+noti send "🚀 Deploy started: v1.2.3"
+./migrate.sh && ./build.sh && ./deploy.sh && \
+  noti embed --title "Deploy" --desc "✅ v1.2.3 live" --color "#2ecc71" \
+    --field Duration "${SECONDS}s" \
+|| noti embed --title "Deploy" --desc "❌ Aborted" --color "#e74c3c" \
+    --field "Failed stage" "$(basename "$0")" \
+    --field Duration "${SECONDS}s"
 ```
 
 ## Safety & etiquette
