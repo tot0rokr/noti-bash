@@ -7,6 +7,35 @@
 
 ---
 
+## 목차
+
+- [특징 (Features)](#특징-features)
+- [Provider 지원 매트릭스](#provider-지원-매트릭스)
+- [요구사항](#요구사항)
+- [설치](#설치)
+- [Webhook 발급받기](#webhook-발급받기)
+  - [Discord — Server / Channel webhook](#discord--server--channel-webhook)
+  - [Slack — Incoming Webhooks](#slack--incoming-webhooks)
+  - [발급한 URL 확인](#발급한-url-확인)
+- [빠른 시작 (Quick Start)](#빠른-시작-quick-start)
+- [설정 (Configuration)](#설정-configuration)
+- [환경변수 (Environment Variables)](#환경변수-environment-variables)
+- [서브커맨드 (Commands)](#서브커맨드-commands)
+  - [`send` — 텍스트 메시지](#1-send--텍스트-메시지)
+  - [`embed` — 임베드 카드](#2-embed--임베드-카드)
+  - [`file` — 파일 업로드 (Discord 전용)](#3-file--파일-업로드-discord-전용)
+  - [`run` — 명령 실행 후 결과 전송](#4-run--명령-실행-후-결과-전송)
+- [프리셋(별칭) 상세](#프리셋별칭-상세)
+- [디버깅](#디버깅)
+- [레이트 리밋/에러 처리](#레이트-리밋에러-처리)
+- [보안 모범 사례](#보안-모범-사례)
+- [CI/CD 예시](#cicd-예시)
+- [문제 해결(Troubleshooting)](#문제-해결troubleshooting)
+- [반환값 요약](#반환값-요약)
+- [라이선스](#라이선스)
+
+---
+
 ## 특징 (Features)
 
 - **Discord & Slack 동시 지원**: webhook URL 로 자동 감지, 동일한 CLI/preset/플래그
@@ -52,6 +81,54 @@ sudo install -m 0755 noti /usr/local/bin/noti
 
 # 실행 확인
 noti help
+```
+
+---
+
+## Webhook 발급받기
+
+`noti` 는 **incoming webhook URL** 만 있으면 동작합니다. URL 자체가 인증 토큰이므로 외부에 노출되지 않게 주의하세요(저장소 커밋 금지, CI 비밀변수 사용).
+
+### Discord — Server / Channel webhook
+
+1. Discord 서버에서 채널 우클릭 → **채널 편집(Edit Channel)** → **연동(Integrations)** → **웹후크(Webhooks)**.
+   - 또는 서버 설정 → 연동 → 웹후크.
+2. **새 웹후크(New Webhook)** 클릭.
+3. 이름/아이콘/대상 채널을 지정한 뒤 **웹후크 URL 복사(Copy Webhook URL)**.
+4. URL 형식: `https://discord.com/api/webhooks/<ID>/<TOKEN>`
+5. 환경변수에 설정:
+   ```bash
+   export NOTI_WEBHOOK='https://discord.com/api/webhooks/.../...'
+   ```
+
+> 필요 권한: 서버에서 **웹후크 관리(Manage Webhooks)** 권한이 있어야 생성/조회 가능합니다.  
+> 토큰 유출 시 같은 화면에서 **삭제** 또는 **새 URL 발급**(기존 URL 폐기) 하세요.
+
+### Slack — Incoming Webhooks
+
+가장 단순한 방식은 **Slack App** 의 *Incoming Webhooks* 기능을 사용하는 것입니다.
+
+1. <https://api.slack.com/apps> 접속 → **Create New App** → **From scratch**.
+2. 앱 이름과 워크스페이스 선택 → **Create App**.
+3. 좌측 메뉴 **Features → Incoming Webhooks** → 토글을 **On** 으로.
+4. 페이지 하단 **Add New Webhook to Workspace** → 게시할 채널 선택 → **Allow**.
+5. 생성된 URL을 복사. 형식: `https://hooks.slack.com/services/<T...>/<B...>/<...>`
+6. 환경변수에 설정:
+   ```bash
+   export NOTI_WEBHOOK='https://hooks.slack.com/services/.../.../...'
+   ```
+
+> 한 webhook URL 은 **하나의 채널에만 게시**됩니다. 채널을 바꾸려면 새 webhook 을 추가하세요.  
+> 워크스페이스 관리자 승인이 필요할 수 있습니다(워크스페이스 설정에 따라 다름).  
+> Slack incoming webhook 은 **파일 업로드/스레드 댓글**을 지원하지 않습니다. 해당 기능이 필요하면 Bot Token + `chat.postMessage`/`files.upload` API 를 사용해야 하며, 이는 v1 범위 밖입니다.
+
+### 발급한 URL 확인
+
+```bash
+NOTI_DEBUG=1 noti send "hello"
+# debug 로그에서 provider 와 마스킹된 URL 이 표시됨
+# 예: [noti:debug] provider=discord
+#     [noti:debug] post_json start provider=discord url=https://discord.com/api/webhooks/123/*** size=...
 ```
 
 ---
