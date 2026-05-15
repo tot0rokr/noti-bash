@@ -17,11 +17,16 @@
 #   4. Idempotent — re-running replaces the managed block with the
 #      desired content (no duplicates).
 #
+# Default flow (with no flags) is "first-time install": PATH is always
+# added, skill install is prompted (Y/n), and the webhook URL is prompted.
+# Pass --no-skill / --no-webhook to opt out of either prompt, or
+# --webhook URL to register the webhook non-interactively.
+#
 # Usage:
-#   ./install                       # interactive
-#   ./install --all                 # non-interactive: PATH + skill (no webhook)
-#   ./install --no-skill            # PATH only, no skill prompt
-#   ./install --no-webhook          # skip webhook prompt entirely
+#   ./install                       # interactive: PATH + skill prompt + webhook prompt
+#   ./install --all                 # PATH + skill (auto-yes) + webhook prompt
+#   ./install --no-skill            # skip skill prompt
+#   ./install --no-webhook          # skip webhook prompt
 #   ./install --webhook URL         # set webhook non-interactively
 #   ./install --rc PATH             # use this rc file (skip auto-detect)
 #   ./install --uninstall           # remove the managed block and skill symlink
@@ -54,7 +59,7 @@ usage() {
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --all)        INSTALL_SKILL=yes;   INSTALL_WEBHOOK=no; shift ;;
+    --all)        INSTALL_SKILL=yes;   shift ;;   # leaves webhook prompt enabled
     --no-skill)   INSTALL_SKILL=no;    shift ;;
     --no-webhook) INSTALL_WEBHOOK=no;  shift ;;
     --webhook)    INSTALL_WEBHOOK=yes; WEBHOOK_URL="${2:?--webhook needs a URL}"; shift 2 ;;

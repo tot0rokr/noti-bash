@@ -94,16 +94,19 @@ git clone https://github.com/tot0rokr/noti-bash.git ~/.noti-bash
   - 비우고 Enter 치면 짧은 수동 안내 + [Webhook 발급받기](#webhook-발급받기) 섹션으로 안내
 - 이미 적용된 부분은 idempotent 하게 skip (블록 내용이 같으면 그대로, 다르면 통째로 교체)
 
-비대화 옵션:
+기본 동작은 **처음 설치 흐름** — PATH 추가, skill 묻기, webhook 묻기 모두 진행합니다. 건너뛰고 싶은 단계만 `--no-*` 로 빼면 됩니다.
 
 ```bash
-~/.noti-bash/install --all                    # PATH + skill (webhook 은 묻지 않음)
-~/.noti-bash/install --no-skill               # PATH 만, skill 건너뜀
-~/.noti-bash/install --no-webhook             # webhook 프롬프트 건너뜀
-~/.noti-bash/install --webhook 'https://...'  # webhook 을 인자로 직접 등록
-~/.noti-bash/install --rc ~/.zshrc            # rc 파일 직접 지정
+~/.noti-bash/install                          # 디폴트: PATH + skill 프롬프트 + webhook 프롬프트
+~/.noti-bash/install --all                    # skill 자동 yes; webhook 은 계속 묻습니다
+~/.noti-bash/install --no-skill               # skill 단계 건너뜀
+~/.noti-bash/install --no-webhook             # webhook 단계 건너뜀
+~/.noti-bash/install --webhook 'https://...'  # webhook 을 인자로 직접 등록 (프롬프트 없이)
+~/.noti-bash/install --rc ~/.zshrc            # rc 파일 직접 지정 (자동 감지 무시)
 ~/.noti-bash/install -h                       # 도움말
 ```
+
+> 비대화 환경(CI 등 stdin 이 tty 가 아닌 경우)에서는 프롬프트가 자동으로 skip 되며 hang 없이 종료됩니다. 비대화로 webhook 까지 등록하려면 `--webhook 'https://...'` 를 같이 주세요.
 
 설치 후 새 shell 열거나 `source ~/.bashrc` 를 한 번 실행하면 `noti help` 가 동작합니다.
 
