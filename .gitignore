@@ -1,0 +1,16 @@
+# Local Claude Code settings — may contain webhook URLs / tokens
+.claude/settings.local.json
+
+# Runtime noti config (may contain webhook URL as credential)
+.noti.conf
+.noti.preset
+
+# Env files
+.env
+.env.*
+!.env.example
+
+# Editor / OS
+*.swp
+*.swo
+.DS_Store
